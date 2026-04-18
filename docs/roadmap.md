@@ -52,7 +52,7 @@ Shipped support modules:
 ### 1.3 Hermes investigation — DONE
 
 7 reports, full installation, strategic recommendation. Bottom line:
-**cherry-pick 4 patterns (~200 lines), do not migrate**. See §5.
+**cherry-pick 4 patterns (~200 lines), do not migrate**. See §6.
 
 ---
 
@@ -180,9 +180,146 @@ mostly software for now.
 
 ---
 
-## 3. Should-Have (high value)
+## 3. Exception Handler (high priority)
 
-### 3.1 Skill evolution Phase 1 — trace rollup + measurement
+Inspired by the PUA project (github.com/tanweai/pua, 16k stars) but
+with proper engineering instead of gimmicky "pressure" rhetoric. PUA
+demonstrated that structured methodology selection, graduated failure
+response, and context preservation across compaction measurably
+improve task completion. We adopt the engineering, drop the theatrics.
+
+Three components, all in `src/camflow/engine/`, wired into the CAM
+engine main loop.
+
+### 3.1 Methodology Router
+
+**Problem.** The same generic "retry with more context" prompt goes
+to debug tasks, build tasks, research tasks, and architecture tasks
+alike. Each of these benefits from a different problem-solving
+strategy; picking the right one up front cuts iterations.
+
+**Fix.** Auto-select a methodology by inspecting the node's `do` field
+(and optionally its `with` hints), then inject the matching procedure
+into the agent's prompt.
+
+| Node category (detected from `do`) | Methodology injected |
+|-----------------------------------|--------------------|
+| debug / fix / repair | **RCA** — reproduce → isolate → hypothesize → verify |
+| build / compile / package | **Simplify-first** — question assumptions, remove unnecessary, simplify, accelerate |
+| research / analyze / investigate | **Search-first** — find prior art, compare approaches, synthesize |
+| architecture / design / refactor | **Working-backwards** — define outcome, identify constraints, design, validate |
+| test / verify / validate | **Systematic coverage** — enumerate cases, prioritize edge cases, prove/disprove |
+
+Detection is keyword-based on the node name and `do` field. Unknown
+node types get a neutral fallback (no methodology injection).
+
+**Files (new).**
+- `src/camflow/engine/methodology_router.py` — `detect_category(node)` and `methodology_for(category)`
+- `src/camflow/backend/cam/prompt_builder.py` — new `_methodology_block(node)` call, placed just above the task section
+- `tests/unit/test_methodology_router.py` — category detection + fallback
+
+**Acceptance.** For each category, a representative node name routes
+to the expected methodology. A node like `start` with `do: agent claude`
+and no keyword match gets no injection (neutral fallback, verified by
+test).
+
+### 3.2 Failure Escalation Ladder
+
+**Problem.** After `max_retries` attempts with context-aware retry
+prompts, the engine gives up. But real debugging sometimes needs a
+qualitative shift in strategy — not just another retry. Today's retry
+loop is flat; we need graduated response levels.
+
+**Fix.** Track an escalation level per node in state, incrementing on
+each failure. Each level applies a different intervention:
+
+| Level | Name | Intervention |
+|------:|------|------|
+| L0 | Normal | Standard retry with context from previous failure (current behavior) |
+| L1 | Rethink | Force a fundamentally different approach. Banner: "your previous approach failed, try a completely different strategy — do NOT re-apply the prior fix" |
+| L2 | Deep Dive | Require source code reading + 3 distinct hypotheses written down BEFORE any fix attempt; reject the result if the fix-first pattern is detected |
+| L3 | Diagnostic | Activate the full checklist: read all related files, check dependencies, verify environment assumptions, inspect relevant logs, dump state |
+| L4 | Escalate | Flag for human review. Save full diagnostic state under `.camflow/escalation/<node>-<ts>.json`. Optionally send notification via a messaging skill (Teams, email). Workflow enters `waiting` status until manual `resume` |
+
+**Semantics.**
+- Escalation level is per-node: `state.escalation[node_id] = L0..L4`
+- Reset to L0 when the node succeeds OR when workflow pc moves to a
+  different node
+- Level advances by one on each consecutive failure at that node
+- Max-retries still applies within a level; transitioning through all
+  levels without success ends in L4 (escalate)
+
+**Files (new).**
+- `src/camflow/engine/escalation.py` — `class Escalation` with
+  `level_for(node_id, state)`, `advance(node_id, state)`,
+  `reset(node_id, state)`, and `banner_for(level)` (returns the
+  prompt-prefix string for that level)
+- `src/camflow/backend/cam/engine.py` — wire into the retry branch of
+  `_apply_result_and_transition`: after incrementing `retry_counts`,
+  call `Escalation.advance`; pass the level to `build_retry_prompt` so
+  the banner and procedure change with the level
+- `src/camflow/backend/cam/prompt_builder.py` — `build_retry_prompt`
+  gains an `escalation_level` parameter that selects the right banner
+- `tests/unit/test_escalation.py` — level progression, reset on
+  success, reset on node change, max-level behavior
+
+**Acceptance.** A node that fails 4 times produces 4 prompts with
+levels L1, L2, L3, L4 in order (L0 was the initial attempt). On the
+5th call (still failing), workflow enters `waiting` with a diagnostic
+bundle written to `.camflow/escalation/<node>-<ts>.json`.
+
+### 3.3 PreCompact State Preservation
+
+**Problem.** Long-running agent nodes can fill the Claude Code context
+window and trigger auto-compaction. When compaction happens, critical
+debugging state can be summarized away: the failure count, the
+current hypothesis, the set of files already tried. The agent
+effectively starts over mid-task.
+
+**Fix.** Detect compaction (via a Claude Code hook, or via size
+monitoring as a fallback). Immediately before compaction, preserve a
+structured preamble and re-inject it into the compacted context so
+the agent keeps its debugging state.
+
+Preserved fields:
+- `failure_count` — consecutive failures at this node
+- `escalation_level` — current L0..L4
+- `current_hypothesis` — last stated hypothesis (from result.summary)
+- `files_touched` — list of paths read or modified this node
+- `test_results_summary` — last pass/fail counts
+- `key_observations` — short bullets the agent flagged as important
+
+**Files (new).**
+- `src/camflow/engine/compact_guard.py` — `snapshot(state, node_id)`
+  and `build_preamble(snapshot)`; writes to
+  `.camflow/precompact/<node>.json`
+- Claude Code hook (installed by the engine on first agent run)
+  detects `PreCompact` events and calls into the guard
+- `src/camflow/backend/cam/prompt_builder.py` — on retry, read the
+  latest preamble for the node and prepend it to the prompt
+- `tests/unit/test_compact_guard.py` — snapshot/preamble round-trip;
+  missing-hook fallback path
+
+**Acceptance.** Simulate compaction during a multi-turn agent run.
+Post-compaction, the agent's next prompt contains the structured
+preamble (hypothesis, escalation level, files touched). Agent behavior
+matches the pre-compaction trajectory rather than restarting.
+
+### 3.4 Rationale
+
+Three things, none of them "AI pressure":
+- **Right tool for the job.** Methodology routing picks a debugging
+  strategy that matches the problem shape, not a one-size prompt.
+- **Graduated response.** Repeated failure doesn't get the same prompt
+  louder — it gets a different strategy, and eventually human review.
+- **State preservation.** Long tasks keep their working state across
+  context compaction instead of silently losing it.
+
+---
+
+## 4. Should-Have (high value)
+
+### 4.1 Skill evolution Phase 1 — trace rollup + measurement
 
 **Problem.** GEPA's pitch is "40% faster self-evolving skills". In
 practice GEPA is an offline tool that costs $2–10/run and doesn't ship
@@ -203,7 +340,7 @@ We can build trace-driven evolution that's actually online.
 - `src/camflow/evolve/report.py` — produces report.json
 - `src/camflow/evolve/cli.py` — `cam evolve report` entry point
 
-### 3.2 Port 3 hermes-CCC core skills
+### 4.2 Port 3 hermes-CCC core skills
 
 The Hermes "core-brain" skills are pure markdown with a rigid schema
 (Purpose / Activation / Procedure / Decision rules / Output contract /
@@ -218,7 +355,7 @@ Failure modes). Directly portable.
 Each port: copy, rename references from `hermes-*` to `cam-*`, adapt
 examples to cam-flow workflow context.
 
-### 3.3 Iteration budget with cmd-refund
+### 4.3 Iteration budget with cmd-refund
 
 **Problem.** A runaway workflow can spawn unlimited agents. Current
 guard is `max_node_executions` (loop detection), but that counts all
@@ -231,7 +368,7 @@ consume the same budget as `agent` nodes.
 
 Enforced in `engine.py::_execute_step` before dispatch.
 
-### 3.4 Dry-run mode polish
+### 4.4 Dry-run mode polish
 
 Dry-run exists but is minimal — static walk of the happy path.
 Enhance to:
@@ -244,7 +381,7 @@ Enhance to:
 
 ---
 
-## 4. Nice-to-Have (future)
+## 5. Nice-to-Have (future)
 
 | # | Feature | Target phase |
 |---|---------|-------------|
@@ -256,12 +393,12 @@ Enhance to:
 
 ---
 
-## 5. Hermes Comparison (team reference)
+## 6. Hermes Comparison (team reference)
 
 Investigation summary. Compare honestly so the team understands what
 each tool is actually good at.
 
-### 5.1 Marketing vs reality
+### 6.1 Marketing vs reality
 
 | Claim | Reality |
 |-------|---------|
@@ -270,7 +407,7 @@ each tool is actually good at.
 | "GEPA self-evolution, 40% faster" | GEPA is a separate repo, not built into Hermes runtime. Offline developer tool costing $2–10/run. |
 | "Self-improving agent" | Saves workflows as markdown notes. Not genuine capability expansion. |
 
-### 5.2 Where each tool wins
+### 6.2 Where each tool wins
 
 | Dimension | Hermes | cam-flow |
 |-----------|--------|---------|
@@ -284,28 +421,28 @@ each tool is actually good at.
 | Structured workflow DSL | No | YAML DSL |
 | Self-evolution | GEPA (offline, paid) | Trace-driven (coming Phase 1) |
 
-### 5.3 Conclusion
+### 6.3 Conclusion
 
 Complementary, not competing. Hermes is a smart single-agent with
 chat-first interfaces. cam-flow is a workflow orchestrator for fleets
 of agents doing structured work. Cherry-pick patterns (§2.3, §2.4,
-§3.2), don't migrate.
+§4.2), don't migrate.
 
 ---
 
-## 6. Timeline
+## 7. Timeline
 
 | Window | Items | Outcome |
 |--------|-------|---------|
 | **Week 1–2** | §2.1 agent reuse · §2.2 session ID (camc blocker) · §2.3 structured state · §2.4 fenced recall | Real workflows stop wasting tokens; agents read context without confusion |
-| **Week 3–4** | §3.1 skill evolution Phase 1 · §3.2 port 3 hermes skills | Measurable insight into which skills perform, and 3 hardened skills in rotation |
-| **Week 5–6** | §3.3 iteration budget · §3.4 dry-run polish | Safer autonomous runs; faster iteration on workflow design |
+| **Week 3–4** | §3.1 methodology router · §3.2 escalation ladder · §3.3 precompact state · §4.1 skill evolution Phase 1 · §4.2 port 3 hermes skills | Exception handler online, measurable insight into skill performance, 3 hardened skills in rotation |
+| **Week 5–6** | §4.3 iteration budget · §4.4 dry-run polish | Safer autonomous runs; faster iteration on workflow design |
 | **Month 2** | §2.5 RTL support (artifact refs, test-hex generation) | Hardware verification workflows become feasible |
-| **Month 3+** | §4 items 10–14 | Parallelism, SDK phase, advanced evolution, webhook, Hermes adapter |
+| **Month 3+** | §5 items 10–14 | Parallelism, SDK phase, advanced evolution, webhook, Hermes adapter |
 
 ---
 
-## 7. Open questions
+## 8. Open questions
 
 1. **Agent reuse scope keying.** What identifies "the same loop"? The
    back-edge target node? An explicit `scope:` field in DSL? Needs
@@ -322,6 +459,7 @@ of agents doing structured work. Cherry-pick patterns (§2.3, §2.4,
 
 ---
 
-## 8. Document history
+## 9. Document history
 
 - 2026-04-18 — Initial version after CAM Phase engine shipped and Hermes investigation concluded.
+- 2026-04-18 — Added §3 Exception Handler (methodology router, escalation ladder, precompact state preservation). Inspired by PUA project; engineering only, no pressure rhetoric. Renumbered subsequent sections.
