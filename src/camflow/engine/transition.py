@@ -37,6 +37,16 @@ def resolve_next(node_id, node, result, state):
                     "reason": "matched if fail"
                 }
 
+    if result.get("status") == "success":
+        for rule in transitions:
+            if rule.get("if") == "success":
+                return {
+                    "workflow_status": "running",
+                    "next_pc": rule["goto"],
+                    "resume_pc": None,
+                    "reason": "matched if success"
+                }
+
     for rule in transitions:
         cond = rule.get("if", "")
         if cond.startswith("output."):

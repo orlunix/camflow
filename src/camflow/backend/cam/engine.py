@@ -1,0 +1,571 @@
+"""CAM Phase workflow engine — main execution loop.
+
+Responsibilities (from docs/cam-phase-plan.md):
+  - Load workflow.yaml, initial state
+  - Execute nodes via cmd_runner or agent_runner
+  - Classify errors; retry transient with same prompt, task with context prompt
+  - Inject lessons + last_failure into prompts
+  - Accumulate lessons (dedup + FIFO prune) from agent new_lesson
+  - Track current_agent_id in state for orphan recovery on resume
+  - Atomic state saves, fsync'd trace appends
+  - Per-node and per-workflow timeouts
+  - Loop detection via max_node_executions
+  - Signal handlers for clean shutdown
+  - Dry-run (static walk), progress reporting
+"""
+
+import copy
+import os
+import signal
+import sys
+import time
+import traceback
+from dataclasses import dataclass, field
+
+from camflow.backend.cam.agent_runner import run_agent, RESULT_FILE
+from camflow.backend.cam.cmd_runner import run_cmd
+from camflow.backend.cam.orphan_handler import (
+    ACTION_NO_ORPHAN,
+    decide_orphan_action,
+    handle_orphan,
+)
+from camflow.backend.cam.progress import format_progress_line, write_progress
+from camflow.backend.cam.prompt_builder import build_prompt, build_retry_prompt
+from camflow.backend.cam.tracer import build_trace_entry
+from camflow.backend.persistence import (
+    append_trace_atomic,
+    load_state,
+    save_state_atomic,
+)
+from camflow.engine.dsl import load_workflow, validate_workflow
+from camflow.engine.error_classifier import classify_error, retry_mode
+from camflow.engine.memory import add_lesson_deduped
+from camflow.engine.state import apply_updates, init_state
+from camflow.engine.transition import resolve_next
+
+
+STATE_FILENAME = "state.json"
+TRACE_FILENAME = "trace.log"
+ENGINE_LOG_FILENAME = "engine.log"
+
+
+@dataclass
+class EngineConfig:
+    poll_interval: int = 5
+    node_timeout: int = 600
+    workflow_timeout: int = 3600
+    max_retries: int = 3
+    max_node_executions: int = 10
+    dry_run: bool = False
+    force_restart: bool = False
+    state_filename: str = STATE_FILENAME
+    trace_filename: str = TRACE_FILENAME
+
+
+# ---- Helpers --------------------------------------------------------------
+
+
+def _build_failure_context(node_id, result, attempt_count):
+    """Pack the info agents need on retry into a last_failure dict."""
+    output = result.get("output") or {}
+    stdout_tail = output.get("stdout_tail") or ""
+    stderr_tail = output.get("stderr_tail") or ""
+    # also accept agent-style fail with no output.stdout_tail
+    return {
+        "node_id": node_id,
+        "summary": result.get("summary") or "",
+        "stdout_tail": stdout_tail,
+        "stderr_tail": stderr_tail,
+        "attempt_count": attempt_count,
+    }
+
+
+def _init_runtime_state(state):
+    """Ensure retry_counts and node_execution_count exist in state."""
+    state.setdefault("retry_counts", {})
+    state.setdefault("node_execution_count", {})
+    state.setdefault("lessons", [])
+    state.setdefault("last_failure", None)
+    state.setdefault("current_agent_id", None)
+    return state
+
+
+def _classify_cmd_error(result):
+    """Build an error-classifier-compatible error dict from a cmd result."""
+    if result.get("status") != "fail":
+        return None
+    err = result.get("error")
+    if err and isinstance(err, dict) and err.get("code"):
+        return err
+    return {"code": "CMD_FAIL", "retryable": True, "reason": result.get("summary", "")}
+
+
+def _classify_agent_error(result):
+    """Build error dict from an agent result."""
+    if result.get("status") != "fail":
+        return None
+    err = result.get("error")
+    if err and isinstance(err, dict) and err.get("code"):
+        return err
+    return {"code": "NODE_FAIL", "retryable": True, "reason": result.get("summary", "")}
+
+
+# ---- Engine ---------------------------------------------------------------
+
+
+class Engine:
+    def __init__(self, workflow_path, project_dir, config=None):
+        self.workflow_path = workflow_path
+        self.project_dir = project_dir
+        self.config = config or EngineConfig()
+
+        self.state_path = os.path.join(project_dir, ".camflow", self.config.state_filename)
+        self.trace_path = os.path.join(project_dir, ".camflow", self.config.trace_filename)
+        self.engine_log_path = os.path.join(project_dir, ".camflow", ENGINE_LOG_FILENAME)
+
+        self.workflow = None
+        self.state = None
+        self.step = 0
+        self.workflow_started_at = None
+        self._interrupted = False
+
+    # ---- setup -----------------------------------------------------------
+
+    def _install_signal_handlers(self):
+        def handler(signum, frame):
+            self._interrupted = True
+            # We don't try to do fancy cleanup in the signal handler itself —
+            # we set a flag and let the main loop exit cleanly after the
+            # current node finishes (or after the poll cycle wakes).
+            sys.stderr.write(f"\n[signal {signum}] interrupt requested; finishing current node...\n")
+
+        try:
+            signal.signal(signal.SIGINT, handler)
+            signal.signal(signal.SIGTERM, handler)
+        except (ValueError, OSError):
+            # Might be running in a non-main thread; ignore
+            pass
+
+    def _log_engine_error(self, message, exc=None):
+        os.makedirs(os.path.dirname(self.engine_log_path), exist_ok=True)
+        with open(self.engine_log_path, "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}\n")
+            if exc is not None:
+                f.write(traceback.format_exc())
+                f.write("\n")
+
+    def _load_workflow(self):
+        self.workflow = load_workflow(self.workflow_path)
+        valid, errors = validate_workflow(self.workflow)
+        if not valid:
+            raise ValueError(
+                "workflow validation failed:\n  - " + "\n  - ".join(errors)
+            )
+
+    def _load_or_init_state(self):
+        state = load_state(self.state_path)
+        if state is None:
+            state = init_state()
+        self.state = _init_runtime_state(state)
+
+    def _save_state(self):
+        save_state_atomic(self.state_path, self.state)
+
+    def _append_trace(self, entry):
+        append_trace_atomic(self.trace_path, entry)
+
+    # ---- dry-run ---------------------------------------------------------
+
+    def dry_run(self):
+        """Static walk of the workflow, happy path (all nodes succeed)."""
+        print(f"Dry-run for {self.workflow_path}")
+        print("=" * 60)
+
+        visited = []
+        pc = "start"
+        safety = self.config.max_node_executions * len(self.workflow)
+
+        while pc and safety > 0:
+            safety -= 1
+            if pc not in self.workflow:
+                print(f"ERROR: node '{pc}' referenced but not defined")
+                return 1
+            if pc in visited and visited.count(pc) >= self.config.max_node_executions:
+                print(f"... (node '{pc}' reached max executions; stopping walk)")
+                break
+            visited.append(pc)
+            node = self.workflow[pc]
+            print(f"  → {pc:20s}  do: {node.get('do', '?')}")
+
+            # Follow happy-path transition
+            fake_result = {"status": "success", "output": {}}
+            trans = resolve_next(pc, node, fake_result, self.state or {})
+            pc = trans.get("next_pc")
+
+        print("=" * 60)
+        print(f"Walked {len(visited)} node(s). Terminal pc = {pc!r}.")
+        return 0
+
+    # ---- main loop -------------------------------------------------------
+
+    def run(self):
+        self._install_signal_handlers()
+        self._load_workflow()
+        self._load_or_init_state()
+
+        if self.config.dry_run:
+            return self.dry_run()
+
+        if self.state.get("status") != "running":
+            print(f"Workflow status is '{self.state.get('status')}', not running. Nothing to do.")
+            return self.state
+
+        self.workflow_started_at = time.time()
+
+        # Handle orphan agent BEFORE entering the main loop
+        try:
+            self._handle_orphan_on_start()
+        except Exception as e:
+            self._log_engine_error("orphan handler failed", e)
+            self.state["status"] = "engine_error"
+            self.state["error"] = {"message": str(e)}
+            self._save_state()
+            raise
+
+        # Main loop
+        try:
+            while self.state.get("status") == "running":
+                if self._interrupted:
+                    self.state["status"] = "interrupted"
+                    self._save_state()
+                    break
+
+                if self._workflow_timed_out():
+                    self.state["status"] = "failed"
+                    self.state["error"] = {"code": "WORKFLOW_TIMEOUT"}
+                    self._save_state()
+                    break
+
+                if not self._execute_step():
+                    break
+        except Exception as e:
+            self._log_engine_error("main loop crashed", e)
+            self.state["status"] = "engine_error"
+            self.state["error"] = {"engine_exception": str(e)}
+            self._save_state()
+            raise
+
+        print()
+        print("=" * 60)
+        print(f"Workflow finished: status={self.state.get('status')}, last_pc={self.state.get('pc')}")
+        print("=" * 60)
+        return self.state
+
+    def _workflow_timed_out(self):
+        if not self.workflow_started_at:
+            return False
+        return (time.time() - self.workflow_started_at) > self.config.workflow_timeout
+
+    def _handle_orphan_on_start(self):
+        if self.config.force_restart:
+            if self.state.get("current_agent_id"):
+                print(f"[orphan] --force-restart: discarding agent {self.state['current_agent_id']}")
+                self.state["current_agent_id"] = None
+                self._save_state()
+            return
+
+        action, agent_id = decide_orphan_action(self.state, self.project_dir)
+        if action == ACTION_NO_ORPHAN:
+            return
+
+        print(f"[orphan] detected action={action} agent_id={agent_id}")
+        node_id = self.state["pc"]
+        node = self.workflow.get(node_id)
+        if node is None:
+            self.state["status"] = "failed"
+            self.state["error"] = {"code": "ORPHAN_NODE_MISSING", "pc": node_id}
+            self._save_state()
+            return
+
+        ts_start = time.time()
+        result, completion_signal = handle_orphan(
+            action, agent_id, self.project_dir,
+            self.config.node_timeout, self.config.poll_interval,
+        )
+        ts_end = time.time()
+
+        self._apply_result_and_transition(
+            node_id, node, result,
+            ts_start=ts_start, ts_end=ts_end,
+            agent_id=agent_id,
+            exec_mode="camc",
+            completion_signal=completion_signal,
+            event=f"orphan_{action}",
+            attempt=self.state["retry_counts"].get(node_id, 0) + 1,
+        )
+
+    def _execute_step(self):
+        """Execute one workflow step. Returns False to break the loop."""
+        node_id = self.state["pc"]
+        node = self.workflow.get(node_id)
+        if node is None:
+            print(f"ERROR: node '{node_id}' not found in workflow")
+            self.state["status"] = "failed"
+            self.state["error"] = {"code": "NODE_NOT_FOUND", "pc": node_id}
+            self._save_state()
+            return False
+
+        # Loop detection
+        exec_count = self.state["node_execution_count"].get(node_id, 0) + 1
+        if exec_count > self.config.max_node_executions:
+            print(f"ERROR: node '{node_id}' exceeded max_node_executions ({self.config.max_node_executions})")
+            self.state["status"] = "failed"
+            self.state["error"] = {"code": "LOOP_DETECTED", "node": node_id, "count": exec_count}
+            self._save_state()
+            return False
+        self.state["node_execution_count"][node_id] = exec_count
+
+        self.step += 1
+        attempt = self.state["retry_counts"].get(node_id, 0) + 1
+        is_retry = attempt > 1
+
+        node_started_at = time.time()
+        write_progress(
+            self.project_dir, self.step, node_id, exec_count,
+            attempt, self.config.max_retries,
+            node_started_at, self.workflow_started_at,
+        )
+        print()
+        print(format_progress_line(
+            self.step, node_id, exec_count, attempt,
+            self.config.max_retries, _infer_exec_mode(node), 0,
+        ))
+
+        ts_start = time.time()
+        result, agent_id, completion_signal = self._run_node(
+            node_id, node, attempt=attempt, is_retry=is_retry,
+        )
+        ts_end = time.time()
+
+        return self._apply_result_and_transition(
+            node_id, node, result,
+            ts_start=ts_start, ts_end=ts_end,
+            agent_id=agent_id,
+            exec_mode=_infer_exec_mode(node),
+            completion_signal=completion_signal,
+            event=None,
+            attempt=attempt,
+        )
+
+    def _run_node(self, node_id, node, attempt, is_retry):
+        """Dispatch to cmd_runner or agent_runner. Returns (result, agent_id, signal)."""
+        do = node.get("do", "")
+        per_node_timeout = node.get("timeout", self.config.node_timeout)
+
+        if do.startswith("cmd "):
+            from camflow.engine.input_ref import resolve_refs
+            command = resolve_refs(do[4:], self.state)
+            print(f"  cmd: {command}")
+            result = run_cmd(command, self.project_dir, timeout=per_node_timeout)
+            return (result, None, None)
+
+        # agent, subagent, or skill → all go through camc in CAM phase
+        if is_retry:
+            prev_result = self.state.get("last_failure") or {}
+            prev_summary = prev_result.get("summary")
+            prompt = build_retry_prompt(
+                node_id, node, self.state, attempt,
+                max_attempts=self.config.max_retries,
+                previous_summary=prev_summary,
+            )
+        else:
+            prompt = build_prompt(node_id, node, self.state)
+
+        # Save current_agent_id BEFORE starting so we can detect orphans
+        # (agent starts inside run_agent; we update state after start_agent returns)
+        # For simplicity we pre-clear; run_agent writes before polling.
+        self.state["current_agent_id"] = None
+        self._save_state()
+
+        # The following call doesn't give us agent_id until after start;
+        # we refactor: use low-level start/finalize for explicit state save.
+        from camflow.backend.cam.agent_runner import start_agent, finalize_agent, _wait_for_completion
+        try:
+            agent_id = start_agent(node_id, prompt, self.project_dir)
+        except RuntimeError as e:
+            return (
+                {
+                    "status": "fail",
+                    "summary": f"failed to launch agent: {e}",
+                    "state_updates": {},
+                    "error": {"code": "CAMC_ERROR", "message": str(e)},
+                },
+                None,
+                "launch_failed",
+            )
+
+        self.state["current_agent_id"] = agent_id
+        self.state["current_node_started_at"] = time.time()
+        self._save_state()
+
+        result_path = os.path.join(self.project_dir, RESULT_FILE)
+        completion_signal, _ = _wait_for_completion(
+            agent_id, result_path, per_node_timeout, self.config.poll_interval,
+        )
+        result = finalize_agent(agent_id, completion_signal, self.project_dir)
+
+        self.state["current_agent_id"] = None
+        self.state["current_node_started_at"] = None
+        self._save_state()
+
+        return (result, agent_id, completion_signal)
+
+    def _apply_result_and_transition(self, node_id, node, result, ts_start, ts_end,
+                                     agent_id, exec_mode, completion_signal, event, attempt):
+        """Apply lessons, retry logic, transitions. Returns False to break loop."""
+        input_state = copy.deepcopy(self.state)
+
+        lesson_added = self._maybe_capture_lesson(result)
+
+        # Decide retry vs transition
+        status = result.get("status")
+        error = self._classify_error(node, result)
+        mode = retry_mode(error)
+
+        # Apply state_updates (but remove the new_lesson key since we already handled it)
+        state_updates = dict(result.get("state_updates") or {})
+        state_updates.pop("new_lesson", None)
+        apply_updates(self.state, state_updates)
+
+        if status == "fail":
+            retry_count = self.state["retry_counts"].get(node_id, 0)
+            if retry_count + 1 < self.config.max_retries:
+                # Budget not exhausted — set up retry
+                self.state["retry_counts"][node_id] = retry_count + 1
+                self.state["last_failure"] = _build_failure_context(
+                    node_id, result, attempt_count=attempt,
+                )
+                # pc stays the same — we'll re-enter this node next iter
+                transition = {
+                    "workflow_status": "running",
+                    "next_pc": node_id,
+                    "resume_pc": None,
+                    "reason": f"retry {retry_count + 1}/{self.config.max_retries} ({mode})",
+                }
+                self._finish_step(
+                    node_id, node, result, input_state, transition,
+                    ts_start, ts_end, agent_id, exec_mode,
+                    completion_signal, lesson_added,
+                    event=event or "retry",
+                    attempt=attempt, retry_mode_val=mode,
+                )
+                return True  # continue
+            # budget exhausted — record last_failure and fall through to transition resolution
+            self.state["last_failure"] = _build_failure_context(
+                node_id, result, attempt_count=attempt,
+            )
+
+        # Resolve the DSL transition for success or exhausted-retry fail
+        transition = resolve_next(node_id, node, result, self.state)
+
+        # On success: reset retry counter and clear last_failure
+        if status == "success":
+            self.state["retry_counts"][node_id] = 0
+            self.state["last_failure"] = None
+
+        next_pc = transition["next_pc"]
+        workflow_status = transition["workflow_status"]
+
+        self._finish_step(
+            node_id, node, result, input_state, transition,
+            ts_start, ts_end, agent_id, exec_mode,
+            completion_signal, lesson_added,
+            event=event,
+            attempt=attempt, retry_mode_val=mode if status == "fail" else None,
+        )
+
+        self.state["pc"] = next_pc
+        self.state["status"] = workflow_status
+        self._save_state()
+
+        return workflow_status == "running"
+
+    def _finish_step(self, node_id, node, result, input_state, transition,
+                     ts_start, ts_end, agent_id, exec_mode, completion_signal,
+                     lesson_added, event, attempt, retry_mode_val):
+        """Write trace and save state once per step."""
+        entry = build_trace_entry(
+            step=self.step,
+            node_id=node_id,
+            node=node,
+            input_state=input_state,
+            node_result=result,
+            output_state=self.state,
+            transition=transition,
+            ts_start=ts_start,
+            ts_end=ts_end,
+            attempt=attempt,
+            is_retry=attempt > 1,
+            retry_mode=retry_mode_val,
+            agent_id=agent_id,
+            exec_mode=exec_mode,
+            completion_signal=completion_signal,
+            lesson_added=lesson_added,
+            event=event,
+        )
+        self._append_trace(entry)
+        self._save_state()
+
+        status_str = result.get("status", "?")
+        summary = result.get("summary") or ""
+        reason = transition.get("reason") if transition else ""
+        print(f"  → {status_str}: {summary}")
+        if reason:
+            print(f"  transition: {node_id} → {transition.get('next_pc')!r} ({reason})")
+
+    def _maybe_capture_lesson(self, result):
+        """Extract new_lesson from state_updates, add to lessons list with dedup+prune."""
+        updates = result.get("state_updates") or {}
+        lesson = updates.get("new_lesson")
+        if not lesson:
+            return None
+        lessons = self.state.setdefault("lessons", [])
+        before = len(lessons)
+        add_lesson_deduped(lessons, lesson)
+        if len(lessons) > before or (lesson in lessons and before == 0):
+            return lesson
+        # already present → not added, but return the attempted string for trace
+        return None
+
+    def _classify_error(self, node, result):
+        if result.get("status") != "fail":
+            return None
+        do = node.get("do", "")
+        if do.startswith("cmd "):
+            return _classify_cmd_error(result)
+        # agent-style
+        err = result.get("error")
+        if err and isinstance(err, dict) and err.get("code"):
+            return err
+        return _classify_agent_error(result)
+
+
+def _infer_exec_mode(node):
+    do = node.get("do", "")
+    if do.startswith("cmd "):
+        return "cmd"
+    return "camc"
+
+
+# ---- thin legacy wrapper -------------------------------------------------
+
+
+def run(workflow_path, project_dir, max_steps=None, dry_run=False, config=None):
+    """Back-compat entry point. Returns final state dict."""
+    cfg = config or EngineConfig()
+    if dry_run:
+        cfg.dry_run = True
+    if max_steps is not None:
+        cfg.max_node_executions = max(cfg.max_node_executions, max_steps)
+    eng = Engine(workflow_path, project_dir, cfg)
+    return eng.run()
