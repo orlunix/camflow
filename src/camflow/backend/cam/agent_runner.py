@@ -23,7 +23,9 @@ owns the agent lifecycle:
 import json
 import os
 import re
+import shutil
 import subprocess
+import sys
 import time
 
 from camflow.backend.cam.result_reader import clear_node_result, read_node_result
@@ -32,6 +34,18 @@ from camflow.backend.cam.result_reader import clear_node_result, read_node_resul
 PROMPT_FILE = ".camflow/node-prompt.txt"
 RESULT_FILE = ".camflow/node-result.json"
 CAPTURE_LINES = 50
+
+# Resolve `camc` once at module import. shutil.which() catches PATH
+# inheritance issues (e.g. when the engine is launched from a service
+# manager that strips the user's PATH). Falls back to the bare name so
+# the eventual subprocess error surfaces clearly to the operator.
+CAMC_BIN = shutil.which("camc") or "camc"
+if CAMC_BIN == "camc" and not shutil.which("camc"):
+    print(
+        "WARNING: `camc` not found on PATH; agent_runner will likely fail. "
+        "Set CAMC_BIN env var or install camc.",
+        file=sys.stderr,
+    )
 
 
 # ---- subprocess helpers --------------------------------------------------
@@ -51,7 +65,7 @@ def _get_agent_status(agent_id):
     """Return status dict via `camc --json status <id>`, or None if not found."""
     try:
         proc = subprocess.run(
-            ["camc", "--json", "status", agent_id],
+            [CAMC_BIN, "--json", "status", agent_id],
             capture_output=True, text=True, timeout=10,
         )
         if proc.returncode != 0:
@@ -65,7 +79,7 @@ def _capture_screen(agent_id, lines=CAPTURE_LINES):
     """Grab last N lines of agent screen via `camc capture`."""
     try:
         proc = subprocess.run(
-            ["camc", "capture", agent_id, "-n", str(lines)],
+            [CAMC_BIN, "capture", agent_id, "-n", str(lines)],
             capture_output=True, text=True, timeout=10,
         )
         if proc.returncode == 0:
@@ -79,7 +93,7 @@ def _stop_agent(agent_id):
     """Graceful stop: send the agent an exit request via tmux."""
     try:
         subprocess.run(
-            ["camc", "stop", agent_id],
+            [CAMC_BIN, "stop", agent_id],
             capture_output=True, text=True, timeout=10,
         )
     except Exception:
@@ -90,7 +104,7 @@ def _rm_agent(agent_id):
     """Hard remove from camc registry. `--kill` also kills the tmux session."""
     try:
         subprocess.run(
-            ["camc", "rm", agent_id, "--kill"],
+            [CAMC_BIN, "rm", agent_id, "--kill"],
             capture_output=True, text=True, timeout=10,
         )
     except Exception:
@@ -105,10 +119,66 @@ def _cleanup_agent(agent_id):
     _rm_agent(agent_id)
 
 
+def _list_camflow_agent_ids():
+    """Return ids of every camc agent whose name starts with 'camflow-'."""
+    try:
+        proc = subprocess.run(
+            [CAMC_BIN, "--json", "list"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if proc.returncode != 0:
+            return []
+        agents = json.loads(proc.stdout)
+    except Exception:
+        return []
+    out = []
+    for a in agents:
+        name = ((a.get("task") or {}).get("name") or "")
+        if name.startswith("camflow-"):
+            out.append(a.get("id"))
+    return [aid for aid in out if aid]
+
+
+def cleanup_all_camflow_agents():
+    """Belt-and-suspenders: remove every camflow-* agent from camc.
+
+    Called from the engine's finally block at end-of-run so we never
+    leak agents even if the per-node cleanup path was bypassed (engine
+    crash, signal interrupt, missed except branch).
+    """
+    for aid in _list_camflow_agent_ids():
+        try:
+            subprocess.run(
+                [CAMC_BIN, "rm", aid, "--kill"],
+                capture_output=True, text=True, timeout=10,
+            )
+        except Exception:
+            pass
+
+
+def kill_existing_camflow_agents(except_id=None):
+    """Pre-start cleanup: kill any lingering camflow-* agents before launching a new one.
+
+    Defense in depth: if a previous run leaked an agent (or the user
+    started two engines), this prevents accumulation. Pass `except_id`
+    to keep the orphan you're about to adopt.
+    """
+    for aid in _list_camflow_agent_ids():
+        if except_id and aid == except_id:
+            continue
+        try:
+            subprocess.run(
+                [CAMC_BIN, "rm", aid, "--kill"],
+                capture_output=True, text=True, timeout=10,
+            )
+        except Exception:
+            pass
+
+
 def _send_key(agent_id, key):
     try:
         subprocess.run(
-            ["camc", "key", agent_id, "--key", key],
+            [CAMC_BIN, "key", agent_id, "--key", key],
             capture_output=True, text=True, timeout=10,
         )
     except Exception:
@@ -233,7 +303,7 @@ def start_agent(node_id, prompt, project_dir, allowed_tools=None):
     try:
         proc = subprocess.run(
             [
-                "camc", "run",
+                CAMC_BIN, "run",
                 "--name", f"camflow-{node_id}",
                 "--path", project_dir,
                 # NO --auto-exit: engine owns the lifecycle

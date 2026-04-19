@@ -214,44 +214,80 @@ class Engine:
 
         self.workflow_started_at = time.time()
 
-        # Handle orphan agent BEFORE entering the main loop
         try:
-            self._handle_orphan_on_start()
-        except Exception as e:
-            self._log_engine_error("orphan handler failed", e)
-            self.state["status"] = "engine_error"
-            self.state["error"] = {"message": str(e)}
-            self._save_state()
-            raise
+            # Handle orphan agent BEFORE entering the main loop
+            try:
+                self._handle_orphan_on_start()
+            except Exception as e:
+                self._log_engine_error("orphan handler failed", e)
+                self.state["status"] = "engine_error"
+                self.state["error"] = {"message": str(e)}
+                self._save_state()
+                raise
 
-        # Main loop
-        try:
-            while self.state.get("status") == "running":
-                if self._interrupted:
-                    self.state["status"] = "interrupted"
-                    self._save_state()
-                    break
+            # Main loop
+            try:
+                while self.state.get("status") == "running":
+                    if self._interrupted:
+                        self.state["status"] = "interrupted"
+                        self._save_state()
+                        break
 
-                if self._workflow_timed_out():
-                    self.state["status"] = "failed"
-                    self.state["error"] = {"code": "WORKFLOW_TIMEOUT"}
-                    self._save_state()
-                    break
+                    if self._workflow_timed_out():
+                        self.state["status"] = "failed"
+                        self.state["error"] = {"code": "WORKFLOW_TIMEOUT"}
+                        self._save_state()
+                        break
 
-                if not self._execute_step():
-                    break
-        except Exception as e:
-            self._log_engine_error("main loop crashed", e)
-            self.state["status"] = "engine_error"
-            self.state["error"] = {"engine_exception": str(e)}
-            self._save_state()
-            raise
+                    if not self._execute_step():
+                        break
+            except Exception as e:
+                self._log_engine_error("main loop crashed", e)
+                self.state["status"] = "engine_error"
+                self.state["error"] = {"engine_exception": str(e)}
+                self._save_state()
+                raise
+        finally:
+            # ALWAYS clean up agents on exit — success, failure, signal,
+            # uncaught exception, anything. Two passes: (1) explicitly
+            # stop+rm the current agent if state still names one; (2)
+            # belt-and-suspenders, sweep the camc registry for any
+            # camflow-* leftovers.
+            self._cleanup_on_exit()
 
         print()
         print("=" * 60)
         print(f"Workflow finished: status={self.state.get('status')}, last_pc={self.state.get('pc')}")
         print("=" * 60)
         return self.state
+
+    def _cleanup_on_exit(self):
+        """Last-resort agent cleanup. Best-effort; never raises."""
+        from camflow.backend.cam.agent_runner import (
+            _cleanup_agent,
+            cleanup_all_camflow_agents,
+        )
+
+        try:
+            current = (self.state or {}).get("current_agent_id")
+            if current:
+                _cleanup_agent(current)
+                self.state["current_agent_id"] = None
+                try:
+                    self._save_state()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Belt and suspenders: any camflow-* agent in the registry,
+        # remove it. If the engine is sharing the host with another
+        # engine instance this is overly aggressive — but the alternative
+        # (leaks) has been worse in practice (6 dead agents observed).
+        try:
+            cleanup_all_camflow_agents()
+        except Exception:
+            pass
 
     def _workflow_timed_out(self):
         if not self.workflow_started_at:
@@ -384,7 +420,17 @@ class Engine:
 
         # The following call doesn't give us agent_id until after start;
         # we refactor: use low-level start/finalize for explicit state save.
-        from camflow.backend.cam.agent_runner import start_agent, finalize_agent, _wait_for_result
+        from camflow.backend.cam.agent_runner import (
+            _wait_for_result,
+            finalize_agent,
+            kill_existing_camflow_agents,
+            start_agent,
+        )
+
+        # Defense in depth: kill any lingering camflow-* agent from a
+        # crashed previous run so we never accumulate. Cheap idempotent op.
+        kill_existing_camflow_agents()
+
         try:
             agent_id = start_agent(node_id, prompt, self.project_dir)
         except RuntimeError as e:
