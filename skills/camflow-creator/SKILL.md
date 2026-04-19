@@ -1,15 +1,10 @@
 ---
 name: camflow-creator
 description: >
-  Set up a cam-flow workflow project in either CLI or CAM mode.
-  Interactively gathers requirements, investigates the environment,
-  generates workflow.yaml via the camflow planner, walks the user
-  through the plan for review, and writes the project files. In CAM
-  mode launches the engine process and EXITS. In CLI mode writes the
-  initial state and tells the user to run camflow-runner via /loop.
-  Triggers on "create a workflow", "set up a flow", "new cam-flow
-  project", "automate this", "build a pipeline", "/flow", or any
-  multi-step task description where the user wants automation.
+  DEPRECATED — superseded by camflow-manager, which covers the full
+  lifecycle (gather + collect + plan + review + setup + kickoff + post)
+  rather than just setup. Do NOT trigger this skill for new work — use
+  camflow-manager instead. Kept as a file only for historical reference.
 version: 1.0.0
 author: cam-flow
 license: MIT

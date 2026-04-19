@@ -1,17 +1,17 @@
 ---
 name: camflow-runner
 description: >
-  Execute exactly ONE node of a cam-flow CLI-mode workflow, update
-  state, then exit. Designed to be called by /loop for continuous
-  execution — /loop calls back after each tick for the next node.
-  Reads .claude/state/workflow.json, identifies the current node
-  from workflow.yaml, executes it (cmd via Bash, agent via the
-  current Claude session), captures the result, enriches state,
-  resolves the next transition, and writes back. Triggers on
-  "run workflow", "/workflow-run", "next step", "continue",
-  "camflow-runner", or via /loop camflow-runner. Supersedes the
-  older workflow-run skill (same file layout, same contract,
-  updated to the six-section state schema and plan-priority fields).
+  Execute exactly ONE node of a cam-flow CLI-mode workflow, then
+  exit. Internal tool called by /loop for continuous execution —
+  /loop calls back after each tick for the next node. Reads
+  .camflow/state.json (legacy fallback: .claude/state/workflow.json),
+  identifies the current node from workflow.yaml, executes it (cmd
+  via Bash, agent via the current Claude session, skill via Skill
+  tool), captures the result, enriches state, resolves the next
+  transition, writes back, and stops. Triggers on "run next step",
+  "continue workflow", "/camflow-runner", or via /loop
+  camflow-runner. Used by camflow-manager in CLI mode — users
+  normally drive it through `/loop camflow-runner`, not directly.
 version: 1.0.0
 author: cam-flow
 license: MIT
@@ -52,13 +52,26 @@ repetition.
 
 ### 1. Read state
 
+State path priority (first existing wins; read-through, don't copy):
+
+1. `.camflow/state.json` — primary, co-located with CAM mode
+2. `.claude/state/workflow.json` — legacy fallback (pre-0.4)
+
 ```bash
-cat .claude/state/workflow.json
+# Prefer .camflow/state.json, fall back to .claude/state/workflow.json
+if [ -f .camflow/state.json ]; then
+  cat .camflow/state.json
+elif [ -f .claude/state/workflow.json ]; then
+  cat .claude/state/workflow.json
+fi
 ```
 
-- File missing → initialize: `{"pc": "start", "status": "running"}`
-  and write it. (camflow-creator should have done this in setup,
-  but be defensive.)
+- Neither file exists → initialize `{"pc": "start", "status":
+  "running", "iteration": 0}` and write it to `.camflow/state.json`
+  (the primary path). camflow-manager should have seeded this in
+  setup; be defensive.
+- When updating an existing state, write back to the SAME path you
+  read from — don't migrate mid-flight.
 - `status = done`      → reply "Workflow completed." and STOP.
 - `status = failed`    → reply "Workflow failed at node <pc>." and
   STOP. Show the last trace entry.
@@ -175,8 +188,10 @@ wins:
 
 ### 7. Write state and trace
 
-Merge everything into state, then atomically write
-`.claude/state/workflow.json`:
+Merge everything into state, then atomically write back to the
+SAME path you read from in Step 1 (`.camflow/state.json` preferred;
+`.claude/state/workflow.json` only if that was the path you loaded
+from):
 
 ```python
 # Pseudo-python (your actual tool calls will be Bash + Write):

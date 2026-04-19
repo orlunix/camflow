@@ -6,6 +6,50 @@ dates are ISO-8601.
 
 ## [Unreleased]
 
+### Added (2026-04-19, final skill architecture)
+- **`camflow-manager` skill** (`skills/camflow-manager/SKILL.md` +
+  `~/.claude/skills/camflow-manager/SKILL.md`) — **the sole
+  user-facing skill** for cam-flow. Full 8-phase lifecycle: GATHER
+  (requirements interview) → COLLECT (resources: skillm list,
+  agents, tools, CLAUDE.md, env) → PLAN (call `camflow plan` as an
+  internal tool) → REVIEW (dependency check, per-node Q&A, explicit
+  user approval required) → SETUP (write workflow.yaml + CLAUDE.md +
+  `.camflow/config.yaml` + CLI state seed) → CONFIRM → KICKOFF
+  (CLI → `/loop camflow-runner`; CAM → `nohup` engine then EXIT) →
+  POST (separate invocation: state check, `camflow evolve report`,
+  REPORT.md). Standing rule: "when uncertain about ANYTHING, ASK
+  THE USER." 11 hard interaction rules including "exit after CAM
+  kickoff — do NOT poll."
+- **Four-component architecture** now explicit: **Manager**
+  (user-facing camflow-manager skill) + **Planner** (`camflow plan`
+  CLI, called by manager) + **Engine** (Python process for CAM
+  mode) + **Runner** (camflow-runner skill for CLI mode). Users
+  only interact with Manager; the other three are internal tools.
+
+### Changed (2026-04-19)
+- **`camflow-runner` state path.** Primary state file is now
+  `.camflow/state.json` (co-located with CAM mode), with
+  `.claude/state/workflow.json` kept as a legacy fallback for
+  pre-0.4 projects. Runner reads-through and writes back to the
+  same path it loaded from — no mid-flight migration.
+- **`camflow-runner` description** clarified as an **internal tool**
+  used by camflow-manager in CLI mode; users drive it via
+  `/loop camflow-runner` rather than calling it directly.
+
+### Deprecated (2026-04-19)
+- **`camflow-creator` skill** — superseded by `camflow-manager`,
+  which covers the full lifecycle (gather + collect + plan +
+  review + setup + kickoff + post) rather than just setup.
+  File kept for historical reference; description marks it
+  DEPRECATED.
+- **`camflow` skill** (no hyphen — the babysit variant) — superseded
+  by the clean split between camflow-manager (project management)
+  and camflow-runner (execution). The old skill combined the two
+  concerns. File kept for historical reference.
+- **`cam-flow` skill** — description updated to point at
+  camflow-manager rather than the now-deprecated camflow-creator
+  (earlier deprecation pointed the wrong way).
+
 ### Added (2026-04-19, split lifecycle skills)
 - **`camflow-creator` skill** (`skills/camflow-creator/SKILL.md` +
   `~/.claude/skills/camflow-creator/SKILL.md`) — SETUP skill for

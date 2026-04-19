@@ -656,28 +656,79 @@ Shared across backends; fsync'd writes; JSONL append-only trace.
 
 ---
 
-## User-facing lifecycle (cam-flow skill)
+## User-facing lifecycle (camflow-manager skill)
 
-The `cam-flow` skill at `skills/cam-flow/SKILL.md` is the definitive
-user interface. It separates SETUP (an interactive Claude Code agent
-session) from EXECUTION (a separate Python engine process that
-spawns sub-agents on its own) from REPORT (a later, separate
+Four components, one user-facing entry point:
+
+```
+                  ┌─────────────────────────────────┐
+                  │  USER                           │
+                  └──────────────┬──────────────────┘
+                                 │  talks only to manager
+                                 ▼
+                  ┌─────────────────────────────────┐
+                  │  camflow-manager (skill)        │   ← sole user interface
+                  │  project manager                │
+                  │                                 │
+                  │  GATHER → COLLECT → PLAN →      │
+                  │  REVIEW → SETUP → CONFIRM →     │
+                  │  KICKOFF → (EXIT) → POST        │
+                  └──┬──────────────┬───────────┬───┘
+          calls once │   launches   │  hands    │
+                     │              │   off to  │
+                     ▼              ▼           ▼
+         ┌──────────────────┐ ┌──────────┐ ┌──────────────────┐
+         │ Planner          │ │ Engine   │ │ camflow-runner   │
+         │ (camflow plan    │ │ (Python  │ │ (skill)          │
+         │  CLI)            │ │  proc,   │ │                  │
+         │                  │ │  CAM)    │ │  CLI per-tick    │
+         │  architect       │ │          │ │  exec — /loop    │
+         │  (1 LLM call,    │ │  const-  │ │  calls it each   │
+         │  no exec)        │ │  ruction │ │  node            │
+         │                  │ │  crew    │ │                  │
+         └──────────────────┘ └──────────┘ └──────────────────┘
+```
+
+Responsibility split:
+
+| Role      | Component        | Type            | When active         |
+|-----------|------------------|-----------------|---------------------|
+| Manager   | camflow-manager  | Skill (Claude)  | Setup + POST only   |
+| Architect | `camflow plan`   | CLI (LLM call)  | Once, during PLAN   |
+| Builder   | Engine           | Python process  | CAM mode, unattended|
+| Worker    | camflow-runner   | Skill (Claude)  | CLI mode, per /loop |
+
+The manager is the ONLY thing the user talks to. Everything else is
+an internal tool the manager calls or hands off to. In CAM mode the
+manager exits right after kickoff — no Claude session cost during a
+90-minute formal-verify run. In CLI mode the manager seeds state and
+the user drives `/loop camflow-runner` themselves.
+
+### Detail: SETUP → EXECUTION → REPORT
+
+The `camflow-manager` skill at `skills/camflow-manager/SKILL.md`
+separates SETUP (an interactive Claude Code agent session) from
+EXECUTION (a separate Python engine process that spawns sub-agents
+on its own, for CAM mode) from REPORT (a later, separate
 invocation):
 
 ```
  ┌─────────────────────────────────────┐
- │ SETUP AGENT (cam-flow skill)        │
+ │ SETUP AGENT (camflow-manager skill) │
  │                                     │
- │  0. mode select: CLI vs CAM         │
- │  1. requirements interview          │
- │  2. env investigation               │
- │  3. camflow plan → workflow.yaml    │
- │  4. review with user (mandatory)    │
- │  5. write CLAUDE.md + workflow.yaml │
- │  6. launch engine → EXIT            │
+ │  1. GATHER  — interview user        │
+ │  2. COLLECT — resources catalog     │
+ │  3. PLAN    — camflow plan CLI      │
+ │  4. REVIEW  — user approval         │
+ │  5. SETUP   — write project files   │
+ │  6. CONFIRM — final go/no-go        │
+ │  7. KICKOFF:                        │
+ │       CAM → launch engine → EXIT    │
+ │       CLI → seed state, hand off    │
+ │              to /loop camflow-runner│
  └──────────────┬──────────────────────┘
                 │  nohup python3 -m camflow.cli_entry.main
-                │        workflow.yaml &
+                │        workflow.yaml &       (CAM only)
                 ▼
  ┌─────────────────────────────────────┐
  │ ENGINE PROCESS (no Claude session)  │
@@ -695,10 +746,12 @@ invocation):
                 │  user comes back later
                 ▼
  ┌─────────────────────────────────────┐
- │ REPORT AGENT (cam-flow skill,       │
- │               new invocation)       │
+ │ REPORT AGENT                        │
+ │   (camflow-manager Phase 8 POST,    │
+ │    new invocation — no persistent   │
+ │    agent running)                   │
  │                                     │
- │  7. read state.json + trace.log     │
+ │  8. read state.json + trace.log     │
  │     camflow evolve report           │
  │     show REPORT.md                  │
  │     summarize findings              │
@@ -720,11 +773,11 @@ persistent agent waiting. The user (or a future agent session) asks
 "how did it go?" and the skill runs its Step 7 procedure against the
 persisted `.camflow/state.json` and `.camflow/trace.log`.
 
-The alternative, babysit-style skill (`camflow` — no hyphen) stays
-running across all three phases. It's heavier and pays a Claude
-session cost for the whole workflow duration. Use `cam-flow` when
-the engine can run unattended; `camflow` when every node needs
-human eyes.
+Earlier skill variants (`cam-flow`, `camflow` babysit, `camflow-
+creator`) are now DEPRECATED — their responsibilities fold cleanly
+into camflow-manager (lifecycle) + camflow-runner (CLI execution)
++ Planner + Engine. The deprecated skill files are kept for
+reference but should not be triggered for new work.
 
 ---
 

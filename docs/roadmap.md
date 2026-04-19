@@ -656,6 +656,7 @@ don't migrate.
 | Phase | Items | Impact |
 |-------|-------|--------|
 | **✅ Shipped** (Apr 18) | §3.1 stateless execution · §3.2 agent lifecycle fix (kick + no auto-exit) · §3.4 structured state · §3.5 fenced recall · calculator demo passes end-to-end | Working CAM engine; demo proven |
+| **✅ Shipped** (Apr 19) | Final skill architecture: camflow-manager (sole user interface, 8-phase lifecycle) + camflow-runner (CLI per-tick executor) + Planner (`camflow plan` CLI) + Engine (Python CAM process). Deprecated cam-flow / camflow / camflow-creator skills. | Clean four-component split; manager is the only thing users talk to |
 | **This week** | §5.1 context positioning (HQ.1) — prompt reorder | Better agent engagement with CONTEXT |
 | **Week 2** | §5.2 observation masking (HQ.2) · §6.1–6.2 checkpoint local mode (CP.1–2) | Efficient long loops + git safety net |
 | **Week 3** | §5.3 tool scoping (HQ.3) · §5.4 multi-layer verification (HQ.4) · §6.2 branch/remote checkpoint modes | Higher fix success rate |

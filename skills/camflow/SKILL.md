@@ -1,12 +1,12 @@
 ---
 name: camflow
 description: >
-  Full lifecycle management for cam-flow workflows: plan → review →
-  execute → monitor → report. Triggers on "run workflow", "set up a
-  flow", "create a workflow", "build a pipeline", "automate this",
-  "cam-flow", or any multi-step task description where the user wants
-  automation. Core rule: when uncertain, ASK THE USER. Replaces the
-  older workflow-creator and workflow-run skills.
+  DEPRECATED — superseded by camflow-manager (full lifecycle, user-facing)
+  + camflow-runner (CLI-mode per-tick executor). This skill combined
+  lifecycle management with babysitting the engine; the new split
+  cleanly separates project-manager duties from execution. Do NOT
+  trigger this skill for new work — use camflow-manager instead. Kept
+  as a file only for historical reference.
 version: 1.0.0
 author: cam-flow
 license: MIT
