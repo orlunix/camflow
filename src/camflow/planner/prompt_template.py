@@ -36,8 +36,18 @@ PLANNING_RULES = """\
    carries in the `with` field of the producing node.
 6. The plan should be MINIMAL — fewest nodes to achieve the goal.
    More nodes means more retries means more chances to drift.
-7. Agent nodes declare `methodology` (one of: rca, simplify-first,
-   search-first, working-backwards, systematic-coverage).
+7. Agent nodes declare `methodology`. Choose based on what the node DOES:
+   - `simplify-first` — environment setup, build, deploy, write report.
+     Operations that should be as simple as possible. Question assumptions,
+     remove unnecessary complexity, just get it done.
+   - `search-first` — research, code analysis, finding changelists, reading
+     RTL. The node needs to FIND and UNDERSTAND information before acting.
+   - `rca` — debugging, fixing test failures, diagnosing errors.
+     Reproduce the issue, isolate the component, form hypotheses, verify.
+   - `working-backwards` — design, planning, creating verification plans.
+     Define the desired outcome FIRST, then design backwards to reach it.
+   - `systematic-coverage` — running tests, executing verification, code review.
+     Enumerate all cases, prioritize edge cases, prove correctness.
 8. Agent nodes declare `escalation_max` (0..4) — cap the escalation
    ladder at Ln. Non-critical nodes stay at 1 or 2; production
    fixes can go up to 4.
