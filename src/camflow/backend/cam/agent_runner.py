@@ -80,6 +80,58 @@ def _cleanup_agent(agent_id):
         pass
 
 
+def _send_key(agent_id, key):
+    """Send a special key (e.g. Enter) to the agent's tmux session."""
+    try:
+        subprocess.run(
+            ["camc", "key", agent_id, "--key", key],
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception:
+        pass
+
+
+def _kick_prompt(agent_id, max_wait=30, poll=1):
+    """Submit the queued prompt by sending Enter once the TUI is ready.
+
+    `camc run "<prompt>"` pastes the prompt into the Claude Code TUI input
+    box but does NOT submit it (no trailing newline). Without this kick the
+    agent sits at the prompt forever.
+
+    Strategy:
+      1. Poll the screen until we see the prompt char (❯ / > / ›) on the
+         last 5 lines AND text after it (the queued prompt is visible).
+      2. Send Enter once to submit.
+      3. If 30 s pass without seeing the prompt, send Enter anyway
+         (best-effort fallback).
+
+    Idempotent in the sense that if the agent has already moved past the
+    initial prompt, the extra Enter is harmless.
+    """
+    deadline = time.time() + max_wait
+    submitted = False
+    while time.time() < deadline:
+        time.sleep(poll)
+        screen = _capture_screen(agent_id, lines=20)
+        if not screen:
+            continue
+        last_lines = [ln for ln in screen.strip().split("\n")[-5:] if ln.strip()]
+        # Look for a line that begins with the TUI prompt char and has text after it
+        for ln in last_lines:
+            stripped = ln.lstrip()
+            if not stripped:
+                continue
+            if stripped[0] in ("❯", ">", "›") and len(stripped) > 2:
+                _send_key(agent_id, "Enter")
+                submitted = True
+                break
+        if submitted:
+            return
+    # Fallback: send Enter anyway in case the prompt is there but our
+    # detection failed.
+    _send_key(agent_id, "Enter")
+
+
 # ---- core polling --------------------------------------------------------
 
 
@@ -176,6 +228,10 @@ def start_agent(node_id, prompt, project_dir):
     agent_id = _parse_agent_id(proc.stdout)
     if not agent_id:
         raise RuntimeError(f"could not parse agent ID from camc output: {proc.stdout[:500]}")
+
+    # camc pastes the prompt into the TUI input box but doesn't submit it;
+    # send Enter once the TUI is ready so the agent actually starts working.
+    _kick_prompt(agent_id)
 
     return agent_id
 
