@@ -377,7 +377,7 @@ class Engine:
 
         # The following call doesn't give us agent_id until after start;
         # we refactor: use low-level start/finalize for explicit state save.
-        from camflow.backend.cam.agent_runner import start_agent, finalize_agent, _wait_for_completion
+        from camflow.backend.cam.agent_runner import start_agent, finalize_agent, _wait_for_result
         try:
             agent_id = start_agent(node_id, prompt, self.project_dir)
         except RuntimeError as e:
@@ -397,7 +397,7 @@ class Engine:
         self._save_state()
 
         result_path = os.path.join(self.project_dir, RESULT_FILE)
-        completion_signal, _ = _wait_for_completion(
+        completion_signal, _ = _wait_for_result(
             agent_id, result_path, per_node_timeout, self.config.poll_interval,
         )
         result = finalize_agent(agent_id, completion_signal, self.project_dir)

@@ -54,7 +54,7 @@ def test_lessons_accumulate_and_inject(tmp_path, monkeypatch):
         return r
 
     monkeypatch.setattr(agent_runner, "start_agent", fake_start)
-    monkeypatch.setattr(agent_runner, "_wait_for_completion", fake_wait)
+    monkeypatch.setattr(agent_runner, "_wait_for_result", fake_wait)
     monkeypatch.setattr(agent_runner, "finalize_agent", fake_finalize)
 
     cfg = EngineConfig(poll_interval=0, node_timeout=5, max_retries=1)

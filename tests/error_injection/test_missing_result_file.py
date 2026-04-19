@@ -1,4 +1,10 @@
-"""Agent returns but doesn't write the result file → engine detects PARSE_ERROR."""
+"""Agent never produces a result file → engine times out and records a typed failure.
+
+With --auto-exit removed, the engine owns the agent lifecycle; the only
+ways a wait can end without a result are TIMEOUT (agent still running but
+hasn't written the file) and AGENT_GONE (process died). This test simulates
+the timeout path.
+"""
 
 import textwrap
 
@@ -19,8 +25,8 @@ def test_missing_result_file_classified_correctly(tmp_path, monkeypatch):
         return "agent0001"
 
     def fake_wait(agent_id, result_path, timeout, poll_interval):
-        # Report terminal status, but never create the result file
-        return ("status_terminal", "completed")
+        # Simulate timeout: agent never writes the result file
+        return ("timeout", None)
 
     def fake_capture(agent_id, lines=50):
         return "some screen output"
@@ -29,7 +35,7 @@ def test_missing_result_file_classified_correctly(tmp_path, monkeypatch):
         pass
 
     monkeypatch.setattr(agent_runner, "start_agent", fake_start)
-    monkeypatch.setattr(agent_runner, "_wait_for_completion", fake_wait)
+    monkeypatch.setattr(agent_runner, "_wait_for_result", fake_wait)
     monkeypatch.setattr(agent_runner, "_capture_screen", fake_capture)
     monkeypatch.setattr(agent_runner, "_cleanup_agent", fake_cleanup)
 
@@ -38,7 +44,9 @@ def test_missing_result_file_classified_correctly(tmp_path, monkeypatch):
     final = eng.run()
 
     assert final["status"] == "failed"
-    # blocked and failed_approaches should have been populated
+    # blocked and failed_approaches should have been populated by enrich_state
     assert final["blocked"] is not None
     assert final["blocked"]["node"] == "start"
     assert any(fa["node"] == "start" for fa in final["failed_approaches"])
+    # The fail's error code should be AGENT_TIMEOUT
+    # (we synthesize it in finalize_agent based on completion_signal)

@@ -201,7 +201,7 @@ def test_stateless_loop_accumulates_state(tmp_path, monkeypatch):
 
     from camflow.backend.cam import agent_runner
     monkeypatch.setattr(agent_runner, "start_agent", fake_start)
-    monkeypatch.setattr(agent_runner, "_wait_for_completion", fake_wait)
+    monkeypatch.setattr(agent_runner, "_wait_for_result", fake_wait)
     monkeypatch.setattr(agent_runner, "finalize_agent", fake_finalize)
 
     cfg = EngineConfig(poll_interval=0, node_timeout=10, max_retries=1,
@@ -296,7 +296,7 @@ def test_stateless_every_agent_starts_fresh(tmp_path, monkeypatch):
 
     from camflow.backend.cam import agent_runner
     monkeypatch.setattr(agent_runner, "start_agent", fake_start)
-    monkeypatch.setattr(agent_runner, "_wait_for_completion", fake_wait)
+    monkeypatch.setattr(agent_runner, "_wait_for_result", fake_wait)
     monkeypatch.setattr(agent_runner, "finalize_agent", fake_finalize)
 
     cfg = EngineConfig(poll_interval=0, node_timeout=5, max_retries=1)
@@ -362,7 +362,7 @@ def test_stateless_long_loop_prunes_lessons(tmp_path, monkeypatch):
 
     from camflow.backend.cam import agent_runner
     monkeypatch.setattr(agent_runner, "start_agent", fake_start)
-    monkeypatch.setattr(agent_runner, "_wait_for_completion", fake_wait)
+    monkeypatch.setattr(agent_runner, "_wait_for_result", fake_wait)
     monkeypatch.setattr(agent_runner, "finalize_agent", fake_finalize)
 
     cfg = EngineConfig(poll_interval=0, node_timeout=5, max_retries=1,

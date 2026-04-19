@@ -11,7 +11,7 @@ import os
 
 from camflow.backend.cam.agent_runner import (
     _get_agent_status,
-    _wait_for_completion,
+    _wait_for_result,
     finalize_agent,
     RESULT_FILE,
 )
@@ -80,7 +80,7 @@ def handle_orphan(action, agent_id, project_dir, timeout, poll_interval):
     result_path = os.path.join(project_dir, RESULT_FILE)
 
     if action == ACTION_WAIT:
-        completion_signal, _ = _wait_for_completion(
+        completion_signal, _ = _wait_for_result(
             agent_id, result_path, timeout, poll_interval
         )
         result = finalize_agent(agent_id, completion_signal, project_dir)

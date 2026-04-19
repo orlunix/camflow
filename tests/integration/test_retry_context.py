@@ -79,7 +79,7 @@ def test_retry_with_task_mode_injects_context(tmp_path, monkeypatch):
     # Patch the agent_runner functions referenced inside Engine._run_node
     from camflow.backend.cam import agent_runner
     monkeypatch.setattr(agent_runner, "start_agent", fake_start_agent)
-    monkeypatch.setattr(agent_runner, "_wait_for_completion", fake_wait)
+    monkeypatch.setattr(agent_runner, "_wait_for_result", fake_wait)
     monkeypatch.setattr(agent_runner, "finalize_agent", fake_finalize)
 
     wf = _write_workflow(tmp_path)
