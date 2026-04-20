@@ -2,15 +2,18 @@
 
 Usage modes (the first positional argument decides the mode):
 
-    camflow <workflow.yaml> [flags]        # run a workflow (default)
-    camflow resume <workflow.yaml> [flags] # resume a stopped/failed workflow
-    camflow plan "<request>" [flags]       # generate workflow.yaml from NL
-    camflow scout --type ... --query ...   # read-only scout for the planner
-    camflow evolve report <dir> [--json]   # trace-based eval reports
+    camflow <workflow.yaml> [flags]         # run a workflow (default)
+    camflow run <workflow.yaml> [flags]     # explicit form of the default
+    camflow resume <workflow.yaml> [flags]  # resume a stopped/failed workflow
+    camflow plan "<request>" [flags]        # generate workflow.yaml from NL
+    camflow scout --type ... --query ...    # read-only scout for the planner
+    camflow evolve report <dir> [--json]    # trace-based eval reports
 
 Keeping the workflow path as the default first positional argument
 preserves backward compatibility with existing scripts like
-`camflow examples/cam/workflow.yaml`.
+`camflow examples/cam/workflow.yaml`. The explicit `run` form exists
+for parity with the other subcommands (`plan`, `resume`, etc.) and is
+what docs/strategy.md recommends in examples.
 """
 
 import argparse
@@ -140,6 +143,10 @@ def main():
         rc = _run_scout(argv[1:])
     elif argv[0] == "resume":
         rc = _run_resume(argv[1:])
+    elif argv[0] == "run":
+        # Explicit `run` is a synonym for the default positional-path
+        # mode — same parser, same flags, argv[1] is the workflow.
+        rc = _run_workflow(argv[1:])
     else:
         rc = _run_workflow(argv)
     sys.exit(rc)
