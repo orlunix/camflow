@@ -490,11 +490,14 @@ idea only / REJECTED).
   early fails with an explicit reason code.
 - **Source.** `docs/lessons-2026-04-19.md` §P2. Confirmed as a
   standing architectural decision in §3.6 of that doc.
-- **Status.** Idea — immediate (next session). Engine changes:
-  `NODE_FIELDS` += `preflight`, `backend/cam/engine.py` adds a
-  `_run_preflight` call before `_run_node_body`, tests cover the
-  skip-body path. Planner rule: nodes with `timeout > 5min` SHOULD
-  have a preflight.
+- **Status.** SHIPPED 2026-04-19. `NODE_FIELDS` in
+  `engine/dsl.py` now accepts `preflight`; engine.py has
+  `_run_preflight` running BEFORE every node body (shell or agent)
+  with a 60 s timeout; `PREFLIGHT_FAIL` / `PREFLIGHT_TIMEOUT` /
+  `PREFLIGHT_ERROR` error codes; planner prompt embeds the
+  "> 5 min → preflight" rule plus a preflight cookbook.
+  Tests: `tests/unit/test_preflight.py` covers direct, dispatcher,
+  template substitution, timeout, and exception paths.
 
 ### 37. Agent definition system (~/.claude/agents/ reuse)
 
@@ -517,11 +520,16 @@ idea only / REJECTED).
   definition system." Pattern aligns with Claude Code's existing
   agent system and with camflow-manager's COLLECT phase already
   listing `~/.claude/agents/`.
-- **Status.** Idea — immediate (next session). DSL extension in
-  `engine/dsl.py` (agent name resolution); `backend/cam/agent_
-  runner.py` reads the named agent file for model/tools/skills;
-  planner consumes a catalog of available agents during PLAN;
-  camflow-manager already scans `~/.claude/agents/` in COLLECT.
+- **Status.** SHIPPED 2026-04-19. New module
+  `backend/cam/agent_loader.py` parses
+  `~/.claude/agents/<name>.md` frontmatter (name, description, model,
+  tools, skills) and body (system prompt). DSL `classify_do` routes
+  `agent <name>` through the loader; `prompt_builder.build_prompt`
+  takes an `agent_def=` kwarg and injects the persona + role line.
+  Planner prompt now includes an Agent catalog section (pulled via
+  `list_available_agents()`). Model override support is wired through
+  `NODE_FIELDS += 'model'` but not yet enforced against camc (camc
+  has no `--model` flag today) — future promotion to hard-enforce.
 
 ### 38. Domain-specific planner rule sets
 
@@ -544,11 +552,92 @@ idea only / REJECTED).
   the generic prompt with every domain's conventions.
 - **Source.** `docs/lessons-2026-04-19.md` §P4 + §TODO
   "Domain-specific planner rules."
-- **Status.** Idea — immediate (next session). Add
-  `src/camflow/planner/rulepacks/<domain>.md`, `--domain` flag on
-  `camflow plan` (passed through from camflow-manager PLAN phase),
-  prompt_template concatenates the selected pack after the
-  universal rules. Start with `hardware/` and `software/`.
+- **Status.** SHIPPED 2026-04-19. `DOMAIN_PACKS` dict in
+  `planner/prompt_template.py` with `hardware`, `software`,
+  `deployment`, `research` packs; `--domain` flag on
+  `camflow plan` (choices-restricted in argparse); `generate_workflow`
+  takes `domain=` kwarg and passes through. Unknown domains fall
+  through silently. Tests in `test_planner.py` cover injection,
+  hardware content, unknown-domain noop.
+
+### 39. Inline-prompt node type (anonymous default agent)
+
+- **What.** A node whose `do` field has no keyword prefix is treated
+  as a free-text prompt to the default agent:
+  `do: "Fix the bug in calculator.py"`. No `with`, no agent
+  definition — just write the instruction and go.
+- **Why.** For trivial one-off tasks, ceremony (pick an agent name,
+  split `do` and `with`) is noise. Inline prompts make the DSL as
+  terse as the task merits. Named agents remain preferred when the
+  persona / tool scope / skill list actually matters.
+- **Source.** `camflow-dsl-update.md` priority 1.
+- **Status.** SHIPPED 2026-04-19. `classify_do` returns
+  `("inline", body)` for free-text. `build_prompt(inline_task=body)`
+  routes the text as the task body. Tests:
+  `test_node_runner_dispatch.py::test_dispatch_inline_prompt`.
+
+### 40. Rename `cmd` → `shell` (keep `cmd` as alias)
+
+- **What.** Shell command nodes now spell as `shell <command>`. The
+  old `cmd <command>` form is still accepted as a deprecated alias
+  — existing workflows continue to work unchanged.
+- **Why.** "cmd" is ambiguous (Command? cmd.exe? Command pattern?).
+  "shell" says exactly what it is. The planner prompt, docs, and
+  examples now prefer `shell`, and the planner emits `shell` for
+  new plans.
+- **Source.** `camflow-dsl-update.md` priority 1.
+- **Status.** SHIPPED 2026-04-19. `classify_do` folds `cmd` into
+  `shell`. Validator, node_runner, engine.py, planner prompt, and
+  docs all use `shell` as the canonical spelling. No migration
+  needed for existing workflows.
+
+### 41. Verify checks OUTCOME, not OUTPUT (planner rule)
+
+- **What.** Planner prompt rule: verify conditions must check the
+  OUTCOME the node was supposed to achieve, not the OUTPUT of the
+  command that ran. `test -f simv` proves the binary exists but not
+  that the simulation ran. `grep -q finish simv.log` proves sim
+  finished but not that the core executed instructions.
+- **Why.** Production discovery: three separate RV32 ECC / CoreMark
+  nodes passed verify but the real goal wasn't met. Weak verify is
+  worse than no verify — it creates false confidence and lets bad
+  runs propagate downstream.
+- **Source.** `docs/lessons-2026-04-19.md` §P3 + §P6.
+- **Status.** SHIPPED 2026-04-19. Planner prompt `PLANNING_RULES`
+  (§3) and verify-condition cookbook now explicitly state "OUTCOME,
+  not OUTPUT" with worked examples.
+
+### 42. One node = one independently verifiable deliverable (planner rule)
+
+- **What.** Planner prompt rule: split any node that would need to do
+  X, check, then do Y. Each node should produce exactly one thing you
+  can prove with a single verify check.
+- **Why.** Production discovery: `run_simv` tried to dump wave +
+  analyze signals + fix boot + recompile + verify + run CoreMark.
+  Timed out mid-work, no state preserved. Fine-grained nodes each
+  with their own verify make progress durable against timeouts.
+- **Source.** `docs/lessons-2026-04-19.md` §P7.
+- **Status.** SHIPPED 2026-04-19. Planner prompt `PLANNING_RULES`
+  (§2) now embeds this rule verbatim.
+
+### 43. Lesson feedback to planner (auto-evolve planner rules)
+
+- **What.** After a workflow completes, rollup `.camflow/trace.log`
+  for patterns ("node X failed N times because Y") and promote
+  recurring patterns into planner rules — either appended to
+  `PLANNING_RULES` or injected as an extra context block on the next
+  plan call. Closes the loop between execution discoveries and
+  planning.
+- **Why.** Right now each production run surfaces new planner rules
+  (verify-outcome, one-node-one-deliverable, preflight) and a human
+  has to hand-edit the prompt. An automated feedback loop compounds
+  every workflow's learning into the next plan without a human in
+  the middle.
+- **Source.** `docs/lessons-2026-04-19.md` §P5 medium-term TODO.
+- **Status.** Idea — medium-term. Requires: trace summarization
+  (`camflow evolve report` already exists), a pattern detector, and
+  a persistent "planner rulebook" file. Groundwork exists in
+  `src/camflow/engine/memory.py` (trace rollup).
 
 ---
 

@@ -6,6 +6,66 @@ dates are ISO-8601.
 
 ## [Unreleased]
 
+### Added (2026-04-19, DSL v2)
+
+- **`shell <command>` node type.** Preferred spelling for shell
+  commands. `cmd <command>` still accepted as a deprecated alias —
+  existing workflows continue to work.
+- **`agent <name>` node type.** References a sub-agent definition at
+  `~/.claude/agents/<name>.md`. New module
+  `src/camflow/backend/cam/agent_loader.py` parses the frontmatter
+  (name, description, model, tools, skills) and body (system prompt),
+  and `build_prompt` injects a persona block + role line. Legacy
+  `agent claude` remains accepted as the anonymous default.
+- **`skill <name>` node type.** Invokes an installed skill via an
+  agent session with an "Invoke the skill named X" preamble.
+- **Inline prompt node type.** Any `do` value that doesn't start with
+  `shell`/`cmd`/`agent`/`subagent`/`skill` is treated as a free-text
+  prompt to the default agent — `do: "Fix the bug in calculator.py"`.
+- **`classify_do(do) -> (kind, body)`** helper in
+  `src/camflow/engine/dsl.py` — single source of truth for DSL
+  parsing. Used by node_runner and engine.py's inlined dispatcher.
+- **`preflight: <shell>` node field** for two-layer validation.
+  Engine runs preflight BEFORE every node body; on non-zero exit the
+  body is skipped and the node fails immediately as
+  `PREFLIGHT_FAIL`. Timeout, error, and template-ref substitution
+  paths all covered. Pairs with the existing post-agent `verify:`
+  gate — preflight answers "can I even start?", verify answers
+  "did I succeed?".
+- **`model:` node field** — per-node model override hook. Validated
+  in DSL; plumbed through `agent_def` for future hard enforcement
+  (camc has no `--model` flag today).
+- **Planner DSL v2 rewrite.** `src/camflow/planner/prompt_template.py`
+  now describes the new node types, embeds the preflight and
+  OUTCOME-not-OUTPUT rules, carries a verify + preflight cookbook,
+  and ingests an **Agent catalog** block built from
+  `agent_loader.list_available_agents()`.
+- **Domain rule packs.** `DOMAIN_PACKS` dict with `hardware`,
+  `software`, `deployment`, `research` entries; `--domain` flag on
+  `camflow plan` selects one; `generate_workflow(domain=)` threads
+  it through. Unknown domains fall through silently.
+- **Tests.** `tests/unit/test_agent_loader.py` (8 tests),
+  `tests/unit/test_node_runner_dispatch.py` (8 tests),
+  `tests/unit/test_preflight.py` (9 tests), plus DSL-v2 additions to
+  `test_dsl.py` and `test_planner.py`. Full suite: 292 passing.
+
+### Changed (2026-04-19)
+
+- **`planner/validator.py::_is_cmd_node`** now matches both
+  `shell ` and `cmd ` prefixes (DSL v2 canonical + legacy alias).
+- **`NODE_FIELDS`** extended with `preflight` and `model`.
+- **`build_prompt` / `build_retry_prompt`** take optional
+  `agent_def=` and `inline_task=` kwargs. Backwards-compatible —
+  default None preserves prior behavior.
+
+### Deprecated (2026-04-19)
+
+- **`cmd <command>`** in DSL — still accepted, but `shell <command>`
+  is the canonical spelling. Existing workflows don't need migration.
+- **`EXECUTOR_TYPES`** set export from `engine/dsl.py` — kept as an
+  alias of `EXECUTOR_KEYWORDS` for importers, but DSL v2 no longer
+  uses it for validation (inline prompts have no keyword).
+
 ### Added (2026-04-19, final skill architecture)
 - **`camflow-manager` skill** (`skills/camflow-manager/SKILL.md` +
   `~/.claude/skills/camflow-manager/SKILL.md`) — **the sole
