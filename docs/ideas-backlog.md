@@ -703,6 +703,39 @@ idea only / REJECTED).
   references it implicitly via the "prefer scout-confirmed skill,
   else agent, else inline" preference order.
 
+### 48. `camflow resume` subcommand
+
+- **What.** Explicit resume CLI: `camflow resume <wf>` flips
+  `failed/aborted/engine_error` back to `running` and retries the
+  same pc; `--from <node>` jumps pc; `--retry` forces an opt-in
+  flip for `done`/`waiting`. Preserves
+  completed/lessons/trace/failed_approaches; resets `retry_counts`
+  and `node_execution_count` for the resumed pc only.
+- **Why.** Auto-resume (engine reading state.json on `camflow <wf>`)
+  only handled the `running` case — a node that ended in `failed`
+  was stuck. Production discovery: CoreMark workflow ended `done`
+  with a suspect score; the user wanted to add a `validate_trace`
+  node and re-run from there without losing the 9 prior nodes' state.
+- **Source.** `camflow-p1-batch.md` priority 2.
+- **Status.** SHIPPED 2026-04-19. See
+  `src/camflow/cli_entry/resume.py`,
+  `tests/unit/test_resume.py` (23 tests).
+
+### 49. `bin/camflow` wrapper + PATH symlink
+
+- **What.** Bash script that resolves the repo root from its own
+  location (symlink-friendly via `readlink -f`), prepends `src/` to
+  PYTHONPATH, exec's `camflow.cli_entry.main`. Symlinked into
+  `~/bin/` so `camflow plan ...` / `camflow resume ...` /
+  `camflow scout ...` Just Work without PYTHONPATH prefixes.
+- **Why.** Friction reduction. The verbose
+  `PYTHONPATH=/path/to/cam-flow/src python3 -m camflow.cli_entry.main`
+  invocation appeared in every camflow-manager skill recipe and every
+  user message. A wrapper kills the boilerplate without touching
+  Python imports.
+- **Source.** `camflow-wrapper.md`.
+- **Status.** SHIPPED 2026-04-19. See `bin/camflow`.
+
 ### 47. Planner scouts as Anthropic SDK tools (Option A)
 
 - **What.** Re-host `run_skill_scout` and `run_env_scout` as

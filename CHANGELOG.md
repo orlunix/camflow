@@ -6,6 +6,43 @@ dates are ISO-8601.
 
 ## [Unreleased]
 
+### Added (2026-04-19, resume + CLI wrapper)
+
+- **`camflow resume <workflow.yaml>` subcommand**
+  (`src/camflow/cli_entry/resume.py`). Pick up a stopped, failed,
+  aborted, or done workflow without restarting from scratch. Behavior:
+    * `failed` / `aborted` / `engine_error` → auto-flip status back
+      to `running`, retry the failed node. Resets `retry_counts` and
+      `node_execution_count` for that pc only (other nodes keep their
+      counts; loop guard remembers the rest of the workflow).
+    * `done` → refuses without `--from <node_id>`; explicit re-run
+      from a chosen node only.
+    * `waiting` → refuses without `--retry` (waiting on an external
+      event is intentional; don't break it silently).
+    * `running` → no edits, hand off to engine (auto-resume case).
+  Flags:
+    * `--from <node>` jump pc, also clears `state.blocked` and
+      `state.last_failure` (you're choosing a new starting point, not
+      retrying the same broken node).
+    * `--retry` force-flip non-running statuses.
+    * `--dry-run` apply state edits and print what would happen but
+      don't spawn the Engine — useful for verifying the resume plan
+      before a long-running workflow takes off.
+  Preserves `completed`, `lessons`, `failed_approaches`, `trace.log`
+  unchanged. The state-mutation logic is in `_prepare_state` (pure
+  function, fully unit-tested).
+- **`bin/camflow` wrapper script** — symlink-friendly Bash wrapper
+  that resolves the repo root via `readlink -f` and exec's
+  `camflow.cli_entry.main`. Lets users put a `camflow` symlink on
+  PATH (e.g. `~/bin/camflow → <repo>/bin/camflow`) and run
+  `camflow plan ...`, `camflow resume ...`, etc. without the
+  `PYTHONPATH=… python3 -m …` boilerplate.
+- **Tests** — `tests/unit/test_resume.py` (23 tests) covers the
+  pure `_prepare_state` matrix (each terminal status × each flag
+  combination), retry-budget reset semantics, the CLI wrapper
+  end-to-end with a stubbed Engine, and argparse wiring. 343 unit
+  tests passing.
+
 ### Added (2026-04-19, planner scouts + promotion guideline)
 
 - **`src/camflow/planner/scouts.py`** — read-only environment + skill
