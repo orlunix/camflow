@@ -39,7 +39,7 @@ from camflow.backend.persistence import (
     save_state_atomic,
 )
 from camflow.engine.checkpoint import checkpoint_after_success
-from camflow.engine.dsl import load_workflow, validate_workflow
+from camflow.engine.dsl import classify_do, load_workflow, validate_workflow
 from camflow.engine.error_classifier import classify_error, retry_mode
 from camflow.engine.escalation import get_escalation_level
 from camflow.engine.methodology_router import select_methodology_label
@@ -399,15 +399,53 @@ class Engine:
         do = node.get("do", "")
         per_node_timeout = node.get("timeout", self.config.node_timeout)
 
-        if do.startswith("cmd "):
+        # DSL v2: preflight gate (cheap, ~seconds) runs before the
+        # (potentially expensive) node body. On non-zero exit the body
+        # is skipped entirely and the node fails as PREFLIGHT_FAIL.
+        preflight_result = self._run_preflight(node)
+        if preflight_result is not None:
+            self._last_prompt = None
+            return (preflight_result, None, "preflight_fail")
+
+        kind, body = classify_do(do)
+
+        if kind == "invalid":
+            self._last_prompt = None
+            return (
+                {
+                    "status": "fail",
+                    "summary": f"invalid 'do' field: {body}",
+                    "state_updates": {},
+                    "error": {"code": "INVALID_DO", "do": do, "reason": body},
+                },
+                None,
+                "invalid_do",
+            )
+
+        if kind == "shell":
             from camflow.engine.input_ref import resolve_refs
-            command = resolve_refs(do[4:], self.state)
-            print(f"  cmd: {command}")
+            command = resolve_refs(body, self.state)
+            print(f"  shell: {command}")
             self._last_prompt = None
             result = run_cmd(command, self.project_dir, timeout=per_node_timeout)
             return (result, None, None)
 
-        # agent, subagent, or skill → all go through camc in CAM phase
+        # agent / skill / inline all go through camc in CAM phase.
+        agent_def = None
+        inline_task = None
+        if kind == "agent":
+            agent_def = self._resolve_agent_def(body)
+        elif kind == "skill":
+            # Run the skill inside the current agent session.
+            original_task = node.get("with", "") or ""
+            inline_task = (
+                f"Invoke the skill named '{body}' and follow its instructions. "
+                + original_task
+            )
+        elif kind == "inline":
+            # `do` is the full free-text prompt; no `with` expected.
+            inline_task = body
+
         if is_retry:
             prev_result = self.state.get("last_failure") or {}
             prev_summary = prev_result.get("summary")
@@ -415,9 +453,14 @@ class Engine:
                 node_id, node, self.state, attempt,
                 max_attempts=self.config.max_retries,
                 previous_summary=prev_summary,
+                agent_def=agent_def,
+                inline_task=inline_task,
             )
         else:
-            prompt = build_prompt(node_id, node, self.state)
+            prompt = build_prompt(
+                node_id, node, self.state,
+                agent_def=agent_def, inline_task=inline_task,
+            )
         # Stash prompt so _finish_step can compute prompt_tokens for trace
         self._last_prompt = prompt
 
@@ -481,6 +524,71 @@ class Engine:
         self._save_state()
 
         return (result, agent_id, completion_signal)
+
+    def _run_preflight(self, node):
+        """Run the node's `preflight` cmd if present. Return None on
+        pass or no preflight; return a result dict (with error code
+        PREFLIGHT_FAIL) if the preflight cmd exited non-zero.
+
+        Preflight is the "can I even start?" gate that sits before
+        every expensive node body. Intentionally short timeout (60 s)
+        — a preflight that hangs is a broken preflight.
+        """
+        if not isinstance(node, dict):
+            return None
+        preflight = node.get("preflight")
+        if not preflight:
+            return None
+
+        from camflow.engine.input_ref import resolve_refs
+        resolved = resolve_refs(preflight, self.state)
+        print(f"  preflight: {resolved}")
+        try:
+            proc = subprocess.run(
+                resolved, shell=True, cwd=self.project_dir,
+                capture_output=True, text=True, timeout=60,
+            )
+            if proc.returncode != 0:
+                return {
+                    "status": "fail",
+                    "summary": f"preflight failed: {resolved}",
+                    "state_updates": {},
+                    "error": {
+                        "code": "PREFLIGHT_FAIL",
+                        "exit_code": proc.returncode,
+                        "stdout": (proc.stdout or "")[-500:],
+                        "stderr": (proc.stderr or "")[-200:],
+                    },
+                }
+        except subprocess.TimeoutExpired:
+            return {
+                "status": "fail",
+                "summary": f"preflight timed out: {resolved}",
+                "state_updates": {},
+                "error": {"code": "PREFLIGHT_TIMEOUT"},
+            }
+        except Exception as exc:
+            return {
+                "status": "fail",
+                "summary": f"preflight error: {exc}",
+                "state_updates": {},
+                "error": {"code": "PREFLIGHT_ERROR", "message": str(exc)},
+            }
+        return None
+
+    def _resolve_agent_def(self, name):
+        """Resolve an agent name to a loaded definition, tolerating the
+        legacy 'claude' anonymous sentinel and missing files.
+        """
+        if not name or name == "claude":
+            return None
+        # Lazy import so test fixtures can monkey-patch agent_loader.
+        from camflow.backend.cam.agent_loader import load_agent_definition
+        try:
+            return load_agent_definition(name)
+        except ValueError as e:
+            print(f"  warning: agent definition '{name}' malformed: {e}")
+            return None
 
     def _apply_verify_cmd(self, node, result):
         """Run the node's `verify` cmd if present; override status on failure.

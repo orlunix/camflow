@@ -35,8 +35,9 @@ def _is_agent_node(node):
 
 
 def _is_cmd_node(node):
+    """DSL v2: `shell` is canonical; `cmd` still accepted as alias."""
     do = (node or {}).get("do", "") or ""
-    return do.startswith("cmd ")
+    return do.startswith("shell ") or do.startswith("cmd ")
 
 
 def _node_successors(node):

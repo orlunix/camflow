@@ -93,6 +93,40 @@ class TestBuildPlannerPrompt:
         assert "Example 2" in p
         assert "Example 3" in p
 
+    def test_dsl_v2_node_types_described(self):
+        """Planner prompt must describe shell / agent <name> / skill / inline."""
+        p = build_planner_prompt("x")
+        assert "shell <command>" in p
+        assert "agent <name>" in p
+        assert "Inline prompt" in p or "inline prompt" in p
+        # Legacy `cmd` accepted but not preferred.
+        assert "cmd" in p
+
+    def test_dsl_v2_preflight_rule_present(self):
+        p = build_planner_prompt("x")
+        assert "preflight" in p.lower()
+        assert "PREFLIGHT_FAIL" in p
+
+    def test_includes_agent_catalog(self):
+        agents = [
+            {"name": "rtl-debugger", "description": "Debug RTL",
+             "tools": ["Read", "Bash"], "skills": ["rtl-trace"]},
+        ]
+        p = build_planner_prompt("x", agents_list=agents)
+        assert "Agent catalog" in p
+        assert "rtl-debugger" in p
+        assert "rtl-trace" in p
+
+    def test_domain_pack_hardware(self):
+        p = build_planner_prompt("x", domain="hardware")
+        assert "hardware / RTL" in p
+        assert "analyze-DUT" in p
+
+    def test_domain_pack_unknown_is_silent(self):
+        p = build_planner_prompt("x", domain="bogus")
+        # No pack injected, but also no crash.
+        assert "hardware / RTL" not in p
+
 
 class TestRenderExamples:
     def test_renders_each_example(self):
@@ -260,9 +294,11 @@ class TestGenerateWorkflow:
             generate_workflow("x", llm_call=fake_llm)
 
     def test_raises_on_dsl_invalid(self):
-        # Valid YAML but DSL-invalid (unknown node field)
+        # Valid YAML but DSL-invalid: `do` has a keyword with no body.
+        # (DSL v2 accepts free-text as an inline prompt, so we can't use
+        # "bananas x" anymore — that's now a valid inline prompt.)
         def fake_llm(prompt):
-            return "start:\n  do: bananas x\n"
+            return "start:\n  do: agent\n"
 
         with pytest.raises(ValueError, match="DSL validation"):
             generate_workflow("x", llm_call=fake_llm)

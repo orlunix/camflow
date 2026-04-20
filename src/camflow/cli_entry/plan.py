@@ -53,6 +53,8 @@ def plan_command(args):
             args.request,
             claude_md_path=claude_md,
             skills_dir=skills_dir,
+            domain=args.domain,
+            agents_dir=args.agents_dir,
         )
     except Exception as exc:
         print(f"ERROR: planner failed: {exc}", file=sys.stderr)
@@ -109,6 +111,12 @@ def build_parser(subparsers=None):
                        help="Output file path (default: workflow.yaml)")
     plan.add_argument("--force", action="store_true",
                        help="Write the plan even if validation found errors")
+    plan.add_argument("--domain", default=None,
+                       choices=["hardware", "software", "deployment", "research"],
+                       help="Load a domain-specific rule pack into the planner prompt")
+    plan.add_argument("--agents-dir", default=None,
+                       help="Path to agent definitions directory "
+                            "(default: ~/.claude/agents/)")
     plan.set_defaults(func=plan_command)
 
     if subparsers is None:

@@ -4,7 +4,12 @@ import textwrap
 
 import pytest
 
-from camflow.engine.dsl import load_workflow, validate_node, validate_workflow
+from camflow.engine.dsl import (
+    classify_do,
+    load_workflow,
+    validate_node,
+    validate_workflow,
+)
 
 
 def write_yaml(tmp_path, content):
@@ -35,10 +40,24 @@ def test_validate_node_unknown_field():
     assert any("unknown" in e.lower() for e in errs)
 
 
-def test_validate_node_invalid_executor():
-    ok, errs = validate_node("n", {"do": "banana x"})
+def test_validate_node_invalid_empty_do():
+    """DSL v2: empty or whitespace `do` is invalid (was: unknown executor)."""
+    ok, errs = validate_node("n", {"do": "   "})
     assert not ok
-    assert any("executor" in e for e in errs)
+    assert any("invalid" in e.lower() for e in errs)
+
+
+def test_validate_node_free_text_is_inline_prompt():
+    """DSL v2: any string without a keyword prefix is a valid inline prompt."""
+    ok, errs = validate_node("n", {"do": "banana x"})
+    assert ok, errs
+
+
+def test_validate_node_bare_keyword_rejected():
+    """DSL v2: a keyword with no body is invalid (agent with no name etc.)."""
+    for do in ("agent", "agent ", "shell", "skill"):
+        ok, errs = validate_node("n", {"do": do})
+        assert not ok, f"expected {do!r} to fail"
 
 
 def test_validate_node_transitions_must_have_if_goto():
@@ -76,3 +95,53 @@ def test_validate_workflow_happy_path():
     }
     ok, errs = validate_workflow(wf)
     assert ok, errs
+
+
+# ---------- DSL v2: classify_do ----------
+
+def test_classify_shell_and_cmd_alias():
+    """`shell` is the new spelling; `cmd` is still accepted."""
+    assert classify_do("shell pytest -v") == ("shell", "pytest -v")
+    assert classify_do("cmd pytest -v") == ("shell", "pytest -v")
+
+
+def test_classify_agent_named_and_legacy():
+    assert classify_do("agent rtl-debugger") == ("agent", "rtl-debugger")
+    assert classify_do("agent claude") == ("agent", "claude")
+    assert classify_do("subagent rtl-debugger") == ("agent", "rtl-debugger")
+
+
+def test_classify_skill():
+    assert classify_do("skill rtl-trace") == ("skill", "rtl-trace")
+
+
+def test_classify_inline_prompt():
+    """Free text with no keyword prefix is an inline prompt."""
+    kind, body = classify_do("Fix the bug in calculator.py")
+    assert kind == "inline"
+    assert body == "Fix the bug in calculator.py"
+
+
+def test_classify_invalid():
+    assert classify_do("")[0] == "invalid"
+    assert classify_do("   ")[0] == "invalid"
+    assert classify_do("agent ")[0] == "invalid"
+    assert classify_do(None)[0] == "invalid"
+
+
+# ---------- DSL v2: node field validation ----------
+
+def test_validate_node_model_field():
+    ok, errs = validate_node("n", {"do": "agent claude", "model": "claude"})
+    assert ok, errs
+    ok, errs = validate_node("n", {"do": "agent claude", "model": 3})
+    assert not ok
+
+
+def test_validate_node_preflight_field():
+    ok, errs = validate_node(
+        "n", {"do": "agent claude", "preflight": "test -f simv"}
+    )
+    assert ok, errs
+    ok, errs = validate_node("n", {"do": "agent claude", "preflight": ""})
+    assert not ok

@@ -206,14 +206,15 @@ def _render_tool_scope(node):
     )
 
 
-def build_prompt(node_id, node, state):
+def build_prompt(node_id, node, state, agent_def=None, inline_task=None):
     """Build the prompt for a fresh agent executing one workflow node.
 
     Layout (HQ.1 — CONTEXT positioned first for better model attention):
 
-        [CONTEXT fence]                — accumulated state from prior nodes
+        [CONTEXT fence]                 — accumulated state from prior nodes
         [Methodology hint]              — §4.1 methodology router
         [Escalation hint]               — §4.2 escalation ladder (retries only)
+        [Agent persona]                 — DSL v2: system prompt from agent def
         [Role line]                     — "You are executing workflow node 'X'."
         [Tool scope]                    — §5.3 allowed_tools (soft constraint)
         Your task:
@@ -222,8 +223,19 @@ def build_prompt(node_id, node, state):
 
     Stateless model: called fresh on every node execution. All context is
     carried via the structured state + CLAUDE.md, injected inside the fence.
+
+    DSL v2 extras:
+      agent_def    — dict from agent_loader.load_agent_definition; when
+                     set, its system_prompt is injected as a persona
+                     block before the role line, and its name appears in
+                     the role line.
+      inline_task  — overrides the `with` field. Used when the `do`
+                     field itself is the free-text prompt (no `with`).
     """
-    task = resolve_refs(node.get("with", ""), state)
+    if inline_task is not None:
+        task = resolve_refs(inline_task, state)
+    else:
+        task = resolve_refs(node.get("with", ""), state)
     context_block = _render_context_fence(state, node_id)
     # Plan-level override wins over keyword-based routing.
     plan_methodology = node.get("methodology") if isinstance(node, dict) else None
@@ -248,8 +260,23 @@ def build_prompt(node_id, node, state):
     if escalation_hint:
         sections.append(escalation_hint)
 
+    # DSL v2: persona block from an ~/.claude/agents/<name>.md definition.
+    if agent_def and agent_def.get("system_prompt"):
+        persona_lines = [
+            f"--- AGENT PERSONA: {agent_def.get('name', 'unnamed')} ---",
+            agent_def["system_prompt"],
+            "--- END PERSONA ---",
+        ]
+        sections.append("\n".join(persona_lines))
+
     # Role and constraints
-    sections.append(f"You are executing workflow node '{node_id}'.")
+    role_name = agent_def.get("name") if agent_def else None
+    if role_name:
+        sections.append(
+            f"You are the '{role_name}' agent executing workflow node '{node_id}'."
+        )
+    else:
+        sections.append(f"You are executing workflow node '{node_id}'.")
     if tool_scope_hint:
         sections.append(tool_scope_hint)
 
@@ -261,7 +288,7 @@ def build_prompt(node_id, node, state):
 
 
 def build_retry_prompt(node_id, node, state, attempt, max_attempts=3,
-                       previous_summary=None):
+                       previous_summary=None, agent_def=None, inline_task=None):
     """Prepend a RETRY banner to build_prompt.
 
     In the stateless model the state.failed_approaches already carries the
@@ -279,5 +306,7 @@ def build_retry_prompt(node_id, node, state, attempt, max_attempts=3,
     )
 
     banner = "\n".join(banner_lines)
-    normal = build_prompt(node_id, node, state)
+    normal = build_prompt(
+        node_id, node, state, agent_def=agent_def, inline_task=inline_task
+    )
     return banner + "\n\n" + normal

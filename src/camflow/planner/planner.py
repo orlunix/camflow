@@ -74,6 +74,28 @@ def discover_skills(skills_dir):
     return skills
 
 
+def _discover_agents(agents_dir=None):
+    """Return a list of agent definition dicts for the planner prompt.
+
+    Delegates to `agent_loader.list_available_agents`, which honors the
+    CAMFLOW_AGENTS_DIR env var (set by tests for isolation) and reads
+    from `~/.claude/agents/` by default. When `agents_dir` is passed
+    explicitly it wins over both env var and default.
+    """
+    from camflow.backend.cam.agent_loader import list_available_agents
+    if agents_dir is not None:
+        prev = os.environ.get("CAMFLOW_AGENTS_DIR")
+        os.environ["CAMFLOW_AGENTS_DIR"] = agents_dir
+        try:
+            return list_available_agents()
+        finally:
+            if prev is None:
+                os.environ.pop("CAMFLOW_AGENTS_DIR", None)
+            else:
+                os.environ["CAMFLOW_AGENTS_DIR"] = prev
+    return list_available_agents()
+
+
 def _read_frontmatter(md_path):
     """Extract the YAML frontmatter block from a markdown file."""
     try:
@@ -149,6 +171,8 @@ def generate_workflow(
     skills_dir=None,
     env_info=None,
     llm_call=None,
+    domain=None,
+    agents_dir=None,
 ):
     """Generate a workflow.yaml for `user_request`.
 
@@ -175,11 +199,18 @@ def generate_workflow(
     if env_info:
         effective_env.update(env_info)
 
+    # DSL v2: include an agent catalog from ~/.claude/agents/ so the
+    # planner can refer to named sub-agents via `do: agent <name>`.
+    # Env var override (CAMFLOW_AGENTS_DIR) lets tests isolate.
+    agents_list = _discover_agents(agents_dir)
+
     prompt = build_planner_prompt(
         user_request,
         skills_list=skills_list,
         env_info=effective_env,
         claude_md=claude_md,
+        agents_list=agents_list,
+        domain=domain,
     )
 
     response = llm_call(prompt)
