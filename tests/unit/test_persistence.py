@@ -6,11 +6,48 @@ import os
 import pytest
 
 from camflow.backend.persistence import (
+    _json_default,
     append_trace_atomic,
     load_state,
     load_trace,
     save_state_atomic,
 )
+
+
+class TestJsonDefault:
+    def test_bytes_becomes_string(self):
+        assert _json_default(b"hello") == "hello"
+
+    def test_bytearray_becomes_string(self):
+        assert _json_default(bytearray(b"hi")) == "hi"
+
+    def test_invalid_utf8_bytes_are_replaced(self):
+        # 0xff is never valid utf-8 — errors='replace' keeps us alive
+        out = _json_default(b"ok\xff")
+        assert "ok" in out
+        assert isinstance(out, str)
+
+    def test_set_becomes_sorted_list(self):
+        assert _json_default({"b", "a", "c"}) == ["a", "b", "c"]
+
+    def test_unknown_type_still_raises(self):
+        with pytest.raises(TypeError):
+            _json_default(object())
+
+    def test_save_state_survives_bytes_in_state(self, tmp_path):
+        """Regression: subprocess-captured bytes used to crash the engine."""
+        p = tmp_path / "s.json"
+        save_state_atomic(str(p), {"pc": "x", "raw": b"payload"})
+        got = load_state(str(p))
+        assert got["raw"] == "payload"
+
+    def test_append_trace_survives_bytes(self, tmp_path):
+        p = tmp_path / "trace.log"
+        append_trace_atomic(str(p), {"node_id": "x",
+                                      "node_result": {"error": b"boom"}})
+        line = p.read_text().strip()
+        entry = json.loads(line)
+        assert entry["node_result"]["error"] == "boom"
 
 
 class TestSaveStateAtomic:
