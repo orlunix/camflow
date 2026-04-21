@@ -1,6 +1,32 @@
 """Unit tests for backend.cam.cmd_runner."""
 
-from camflow.backend.cam.cmd_runner import run_cmd
+from camflow.backend.cam.cmd_runner import _coerce_text, _tail, run_cmd
+
+
+class TestCoerceText:
+    def test_bytes_are_decoded(self):
+        assert _coerce_text(b"hi") == "hi"
+
+    def test_bytearray_is_decoded(self):
+        assert _coerce_text(bytearray(b"ok")) == "ok"
+
+    def test_invalid_utf8_bytes_are_replaced_not_raised(self):
+        out = _coerce_text(b"partial\xff")
+        assert isinstance(out, str)
+        assert "partial" in out
+
+    def test_none_becomes_empty_str(self):
+        assert _coerce_text(None) == ""
+
+    def test_str_passes_through(self):
+        assert _coerce_text("already text") == "already text"
+
+
+def test_tail_survives_bytes():
+    """Regression: TimeoutExpired.stdout is bytes even when the original
+    subprocess.run was text=True — _tail used to crash with
+    'bytes is not subscriptable' style errors. Now it coerces first."""
+    assert _tail(b"abcdefghij", 3) == "hij"
 
 
 def test_success(tmp_path):

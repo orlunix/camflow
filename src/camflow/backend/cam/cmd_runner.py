@@ -12,7 +12,29 @@ STDOUT_TAIL = 2000
 STDERR_TAIL = 500
 
 
+def _coerce_text(raw):
+    """Normalise a subprocess stdout/stderr value to str.
+
+    ``subprocess.TimeoutExpired.stdout`` / ``.stderr`` can be ``bytes``
+    even when the original ``run()`` was called with ``text=True`` —
+    the data captured up to the timeout isn't passed through the
+    decoder. If that raw bytes value leaks into state, it crashes
+    later json.dump calls AND string-oriented enrichers
+    (state_enricher._summarize_test_output does ``.split("\n")``).
+    Decode once here so everything downstream sees a plain str.
+    """
+    if raw is None:
+        return ""
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            return raw.decode("utf-8", errors="replace")
+        except Exception:
+            return repr(raw)
+    return raw
+
+
 def _tail(text, n):
+    text = _coerce_text(text)
     if not text:
         return ""
     return text[-n:]

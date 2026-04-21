@@ -58,9 +58,18 @@ def _summarize_test_output(text, iteration):
 
     Prefers the pytest summary line (e.g. "2 failed, 9 passed in 0.05s");
     falls back to the first non-empty line truncated to 80 chars.
+
+    Defensive: subprocess captures occasionally leak bytes into state
+    (TimeoutExpired.stdout is bytes even under ``text=True``); decode
+    here so a stray bytes value can't crash the whole engine.
     """
     if not text:
         return None
+    if isinstance(text, (bytes, bytearray)):
+        try:
+            text = text.decode("utf-8", errors="replace")
+        except Exception:
+            text = repr(text)
     stripped = text.strip()
     if not stripped:
         return None
