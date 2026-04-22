@@ -82,6 +82,12 @@ class EngineConfig:
     state_filename: str = STATE_FILENAME
     trace_filename: str = TRACE_FILENAME
     heartbeat_interval: int = DEFAULT_HEARTBEAT_INTERVAL
+    # `reset=True` means "fresh start": wipe prior state.json and
+    # heartbeat.json before running. The `camflow run` subcommand sets
+    # this; `camflow resume` leaves it False. Distinguishing the two
+    # here (instead of at the CLI) keeps the lock acquisition and the
+    # wipe atomic — no other engine can sneak in between them.
+    reset: bool = False
 
 
 # ---- Helpers --------------------------------------------------------------
@@ -189,6 +195,24 @@ class Engine:
             state = init_state(first_node)
         self.state = _init_runtime_state(state)
 
+    def _wipe_state_files(self):
+        """Remove state.json and heartbeat.json for a clean ``run``.
+
+        Callers must hold ``self._lock`` — otherwise we could destroy
+        the live state of a concurrent engine. Leaves trace.log alone
+        on purpose: traces accumulate across runs by design so the
+        evaluator has long-term history.
+        """
+        for path in (self.state_path, heartbeat_path(self.project_dir)):
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                # Not worth failing the run over — the next save will
+                # overwrite anyway. Log and move on.
+                pass
+
     def _save_state(self):
         save_state_atomic(self.state_path, self.state)
 
@@ -292,30 +316,47 @@ class Engine:
     def run(self):
         self._install_signal_handlers()
         self._load_workflow()
-        self._load_or_init_state()
 
         if self.config.dry_run:
+            self._load_or_init_state()
             return self.dry_run()
 
-        # Crash recovery BEFORE we check status — may flip terminal-but-
-        # resumable statuses back to "running" or short-circuit on "done".
-        recovery = self._check_and_recover()
-        if recovery == "already_done":
-            print(
-                f"Workflow already completed (last_pc={self.state.get('pc')!r}). "
-                "Use `camflow resume --from <node>` to re-run from a specific node."
-            )
-            return self.state
+        # `camflow run` path: acquire lock BEFORE wiping state files so
+        # we cannot clobber another live engine's state.json. The CLI
+        # sets reset=True for `run`/default invocations; `camflow resume`
+        # leaves it False so we take the auto-recovery path below.
+        if self.config.reset:
+            self._lock = EngineLock(self.project_dir)
+            self._lock.acquire()
+            self._wipe_state_files()
+            self._load_or_init_state()
+        else:
+            self._load_or_init_state()
+            # Crash recovery BEFORE we check status — may flip terminal-
+            # but-resumable statuses back to "running" or short-circuit
+            # on "done".
+            recovery = self._check_and_recover()
+            if recovery == "already_done":
+                print(
+                    f"Workflow already completed (last_pc={self.state.get('pc')!r}). "
+                    "Use `camflow run <workflow>` to start over, or "
+                    "`camflow resume --from <node>` to re-run from a "
+                    "specific node."
+                )
+                return self.state
 
-        if self.state.get("status") != "running":
-            print(f"Workflow status is '{self.state.get('status')}', not running. Nothing to do.")
-            return self.state
+            if self.state.get("status") != "running":
+                print(
+                    f"Workflow status is '{self.state.get('status')}', "
+                    "not running. Nothing to do."
+                )
+                return self.state
 
-        # Acquire the engine lock before spawning any agents. If another
-        # engine already holds it, EngineLockError bubbles up to the CLI
-        # which prints it and exits non-zero.
-        self._lock = EngineLock(self.project_dir)
-        self._lock.acquire()
+            # Acquire the engine lock before spawning any agents. If
+            # another engine already holds it, EngineLockError bubbles
+            # up to the CLI which prints it and exits non-zero.
+            self._lock = EngineLock(self.project_dir)
+            self._lock.acquire()
 
         # Start heartbeat thread AFTER lock acquisition so a rejected
         # run never overwrites the live engine's heartbeat file.

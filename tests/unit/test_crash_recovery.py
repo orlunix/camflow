@@ -152,3 +152,40 @@ class TestRunIdempotent:
             Lock.assert_not_called()
             HB.assert_not_called()
         assert result["status"] == "done"
+
+
+class TestRunResetWipesState:
+    """`camflow run` (reset=True) must wipe prior state + heartbeat."""
+
+    def test_reset_wipes_state_and_heartbeat_before_running(self, tmp_path):
+        # Prior run left state at "done" on 'verify' and a stale heartbeat.
+        _write_state(tmp_path, {"pc": "verify", "status": "done"})
+        write_heartbeat(
+            heartbeat_path(tmp_path),
+            {
+                "pid": 4194301,
+                "timestamp": "2020-01-01T00:00:00Z",
+                "pc": "verify",
+            },
+        )
+
+        wf = _wf_yaml(tmp_path)
+        cfg = EngineConfig(reset=True)
+        eng = Engine(wf, str(tmp_path), cfg)
+
+        # Skip the main loop — we only want to prove the wipe happened.
+        with patch.object(Engine, "_install_signal_handlers"):
+            eng._load_workflow()
+            assert eng.config.reset is True
+            # Simulate the lock-then-wipe handshake. We call the
+            # private helper directly since spinning up a full run
+            # would try to execute nodes.
+            eng._wipe_state_files()
+            eng._load_or_init_state()
+
+        # State was re-initialized at the workflow's first node, NOT
+        # carried over from the prior "done" run.
+        assert eng.state["pc"] == "build"
+        assert eng.state["status"] == "running"
+        # Heartbeat file from the prior run is gone.
+        assert not os.path.exists(heartbeat_path(tmp_path))

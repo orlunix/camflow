@@ -151,6 +151,9 @@ def _run_workflow(argv):
         max_node_executions=args.max_node_executions,
         dry_run=args.dry_run,
         force_restart=args.force_restart,
+        # `camflow run` always starts fresh. `--dry-run` is inherently
+        # non-mutating so we leave it alone.
+        reset=not args.dry_run,
     )
     engine = Engine(args.workflow, project_dir, cfg)
     try:
