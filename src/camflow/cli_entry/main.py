@@ -6,7 +6,8 @@ Usage modes (the first positional argument decides the mode):
     camflow run <workflow.yaml> [flags]     # explicit form of the default
     camflow run --daemon <workflow.yaml>    # run in the background
     camflow resume <workflow.yaml> [flags]  # resume a stopped/failed workflow
-    camflow status <workflow.yaml>          # report engine liveness + progress
+    camflow stop [--force]                  # signal a running engine to exit
+    camflow status [workflow.yaml]          # report engine liveness + progress
     camflow plan "<request>" [flags]        # generate workflow.yaml from NL
     camflow scout --type ... --query ...    # read-only scout for the planner
     camflow evolve report <dir> [--json]    # trace-based eval reports
@@ -29,6 +30,8 @@ from camflow.cli_entry.resume import build_parser as build_resume_parser
 from camflow.cli_entry.scout import build_parser as build_scout_parser
 from camflow.cli_entry.status import build_parser as build_status_parser
 from camflow.cli_entry.status import status_command
+from camflow.cli_entry.stop import build_parser as build_stop_parser
+from camflow.cli_entry.stop import stop_command
 from camflow.engine.dsl import load_workflow, validate_workflow
 from camflow.engine.monitor import EngineLockError
 
@@ -206,6 +209,12 @@ def _run_status(argv):
     return status_command(args)
 
 
+def _run_stop(argv):
+    parser = build_stop_parser(None)
+    args = parser.parse_args(argv)
+    return stop_command(args)
+
+
 def _print_top_help():
     print(__doc__.strip())
     print(
@@ -232,6 +241,8 @@ def main():
         rc = _run_resume(argv[1:])
     elif argv[0] == "status":
         rc = _run_status(argv[1:])
+    elif argv[0] == "stop":
+        rc = _run_stop(argv[1:])
     elif argv[0] == "run":
         # Explicit `run` is a synonym for the default positional-path
         # mode — same parser, same flags, argv[1] is the workflow.
