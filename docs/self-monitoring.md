@@ -100,6 +100,35 @@ Because flock is released when the file descriptor closes (including
 on process crash), the lock never persists past an engine's death —
 the next `camflow run` will succeed cleanly.
 
+### Stale-lock recovery
+
+On Linux local filesystems a process exit always releases flock, so
+an abandoned lock file with a dead pid is only a paper tiger — the
+kernel already cleared the real lock. But on NFS (especially when the
+lockd has stale state), with unusual mount configurations, or after
+edge-case `kill -9` scenarios, the kernel can keep flock blocked
+while the pid recorded in the file points at nothing. To avoid making
+the operator `rm .camflow/engine.lock` by hand, `EngineLock.acquire`
+self-heals:
+
+1. If `flock` blocks, read the pid from the file.
+2. If the pid is **missing** (empty file) → respect the lock; another
+   acquirer is mid-write.
+3. If the pid is **alive** → respect the lock; a real engine is
+   running.
+4. If the pid is **dead**:
+   * No heartbeat exists → stale. Unlink and retry once.
+   * A heartbeat exists with a *live* pid → respect the lock (some
+     other engine is alive; the lock file just has a drifted pid).
+   * A heartbeat exists with a *dead* pid that is **fresh** (<5 min)
+     → respect the lock. Gives a just-crashed engine a grace window.
+   * A heartbeat exists with a *dead* pid that is **stale** (≥5 min)
+     → stale. Unlink and retry once.
+
+Unlinking a file while another process still holds flock on its
+inode is safe: the stealer's `open` returns a brand-new inode and
+the old flock becomes irrelevant.
+
 ## Crash recovery flow
 
 ```

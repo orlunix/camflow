@@ -39,6 +39,12 @@ LOCK_FILENAME = "engine.lock"
 
 DEFAULT_HEARTBEAT_INTERVAL = 30   # seconds between writes
 DEFAULT_STALE_THRESHOLD = 120     # seconds after which heartbeat is "stale"
+# Lock-staleness uses a longer window than heartbeat-staleness: a lock
+# held by a dead pid is always stale, but we additionally require the
+# heartbeat (if present) to be at least this old before auto-cleaning —
+# this gives a just-crashed engine a wide grace window in case its
+# recovery layer wants to inspect the file.
+STALE_LOCK_HEARTBEAT_THRESHOLD = 300
 
 
 # ---- time helpers --------------------------------------------------------
@@ -227,6 +233,47 @@ class EngineLockError(RuntimeError):
         super().__init__(msg)
 
 
+def _is_lock_stale(
+    holder_pid: int | None,
+    project_dir: str,
+    heartbeat_threshold: int = STALE_LOCK_HEARTBEAT_THRESHOLD,
+) -> bool:
+    """Decide whether a blocked-acquire lock file can be considered abandoned.
+
+    We only reach this check when ``fcntl.flock`` refused the lock, i.e.
+    the kernel still thinks someone holds it. On Linux local filesystems
+    this should imply a live process (flock is released on FD close,
+    including crashes). But on NFS, on stale mount state, or on edge
+    cases where `kill -9` happened under unusual conditions, the lock
+    file can linger with a dead pid while flock still blocks new
+    acquirers. In those cases we want to self-heal instead of forcing
+    the operator to `rm .camflow/engine.lock`.
+
+    Rules:
+
+    * Holder pid missing / unparseable → NOT stale. Empty file likely
+      means another acquirer is mid-write (opened + flocked, about to
+      seek+write pid). Respect it.
+    * Holder pid is alive → NOT stale. Real engine is running.
+    * Holder pid is dead → Stale IF the heartbeat agrees (missing, or
+      its pid is dead, or it's at least ``heartbeat_threshold`` seconds
+      old). A fresh heartbeat whose pid is alive means a different
+      engine is live and the lock file just has a stale pid — don't
+      steal in that case.
+    """
+    if not holder_pid:
+        return False
+    if is_process_alive(holder_pid):
+        return False
+    hb = load_heartbeat(heartbeat_path(project_dir))
+    if hb is None:
+        return True
+    hb_pid = hb.get("pid")
+    if hb_pid and is_process_alive(hb_pid):
+        return False
+    return is_stale(hb, threshold=heartbeat_threshold)
+
+
 class EngineLock:
     """Exclusive file lock on .camflow/engine.lock (flock-based).
 
@@ -240,31 +287,45 @@ class EngineLock:
     :class:`EngineLockError` whose ``holder_pid`` attribute carries the
     pid recorded in the lock file (best-effort — may be ``None`` if the
     other process hadn't yet written its pid).
+
+    Stale-lock recovery: on a blocked acquire, :func:`_is_lock_stale`
+    checks whether the recorded holder is dead AND the heartbeat
+    confirms. If so, the lock file is unlinked and acquire retries
+    once. Unlinking while another process holds flock on the same
+    inode is safe — the stealer gets a fresh inode, so both locks are
+    independent and the zombie flock becomes irrelevant.
     """
 
     def __init__(self, project_dir: str):
+        self.project_dir = str(project_dir)
         self.path = lock_path(project_dir)
         self._fd = None
 
     def acquire(self) -> None:
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        # Open rw so we can both flock and rewrite the pid. Using "a+"
-        # avoids truncating the file before we know we own the lock
-        # (another process may still hold it).
-        fd = open(self.path, "a+", encoding="utf-8")
-        try:
-            fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            holder = self._read_pid(fd)
-            fd.close()
-            raise EngineLockError(self.path, holder) from None
-        # Truncate + write our pid now that we own the lock.
-        fd.seek(0)
-        fd.truncate()
-        fd.write(str(os.getpid()))
-        fd.flush()
-        os.fsync(fd.fileno())
-        self._fd = fd
+        # Two attempts: the second runs only if we cleaned a stale lock.
+        for attempt in range(2):
+            # Open rw so we can both flock and rewrite the pid. Using "a+"
+            # avoids truncating the file before we know we own the lock
+            # (another process may still hold it).
+            fd = open(self.path, "a+", encoding="utf-8")
+            try:
+                fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                holder = self._read_pid(fd)
+                fd.close()
+                if attempt == 0 and _is_lock_stale(holder, self.project_dir):
+                    self._remove_stale_lock()
+                    continue
+                raise EngineLockError(self.path, holder) from None
+            # Truncate + write our pid now that we own the lock.
+            fd.seek(0)
+            fd.truncate()
+            fd.write(str(os.getpid()))
+            fd.flush()
+            os.fsync(fd.fileno())
+            self._fd = fd
+            return
 
     def release(self) -> None:
         fd = self._fd
@@ -291,6 +352,12 @@ class EngineLock:
             return int(content) if content else None
         except (ValueError, OSError):
             return None
+
+    def _remove_stale_lock(self) -> None:
+        try:
+            os.remove(self.path)
+        except OSError:
+            pass
 
     def __enter__(self):
         self.acquire()

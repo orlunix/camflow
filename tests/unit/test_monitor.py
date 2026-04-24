@@ -5,14 +5,17 @@ Covers:
   * load_heartbeat + is_stale play nice with both fresh and stale files.
   * is_process_alive returns True for self, False for a guaranteed-dead pid.
   * EngineLock blocks a second acquirer with the right holder pid.
+  * EngineLock auto-heals stale lock files (dead holder pid).
 """
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -21,6 +24,7 @@ from camflow.engine.monitor import (
     EngineLock,
     EngineLockError,
     HeartbeatThread,
+    _is_lock_stale,
     _parse_iso,
     _utcnow_iso,
     heartbeat_path,
@@ -30,6 +34,9 @@ from camflow.engine.monitor import (
     lock_path,
     write_heartbeat,
 )
+
+# A pid that (on Linux with default pid_max) cannot exist.
+DEAD_PID = 4194301
 
 
 # ---- time helpers ------------------------------------------------------
@@ -182,3 +189,127 @@ class TestEngineLock:
         # Now a fresh lock should succeed.
         with EngineLock(str(tmp_path)):
             pass
+
+
+# ---- stale-lock recovery ------------------------------------------------
+
+
+def _plant_blocking_lock(tmp_path, pid_to_write: int | None):
+    """Plant a lock file whose flock is held by a zombie fd.
+
+    Returns the zombie fd so the caller can close it in teardown.
+    Simulates the post-SIGKILL / NFS-stuck scenario: flock is still
+    held at the kernel level, but the pid recorded in the file points
+    at a dead process.
+    """
+    p = lock_path(tmp_path)
+    Path(p).parent.mkdir(parents=True, exist_ok=True)
+    fd = open(p, "a+", encoding="utf-8")
+    fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    if pid_to_write is not None:
+        fd.seek(0)
+        fd.truncate()
+        fd.write(str(pid_to_write))
+        fd.flush()
+    return fd
+
+
+def _release_zombie(fd):
+    try:
+        fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        fd.close()
+    except OSError:
+        pass
+
+
+class TestIsLockStale:
+    """Unit-level coverage of the decision function itself."""
+
+    def test_missing_holder_is_not_stale(self, tmp_path):
+        # Empty / unparseable pid → an acquirer is mid-write. Respect it.
+        assert _is_lock_stale(None, str(tmp_path)) is False
+
+    def test_live_holder_is_not_stale(self, tmp_path):
+        assert _is_lock_stale(os.getpid(), str(tmp_path)) is False
+
+    def test_dead_holder_no_heartbeat_is_stale(self, tmp_path):
+        assert _is_lock_stale(DEAD_PID, str(tmp_path)) is True
+
+    def test_dead_holder_with_live_heartbeat_is_not_stale(self, tmp_path):
+        # Weird case: lock file has a wrong/stale pid, but the live
+        # heartbeat says a different process is alive. Don't steal.
+        write_heartbeat(
+            heartbeat_path(tmp_path),
+            {"pid": os.getpid(), "timestamp": _utcnow_iso()},
+        )
+        assert _is_lock_stale(DEAD_PID, str(tmp_path)) is False
+
+    def test_dead_holder_with_fresh_dead_heartbeat_is_not_stale(self, tmp_path):
+        # Holder just died: heartbeat pid matches lock pid and is recent.
+        # Give the engine a grace window before auto-cleaning.
+        write_heartbeat(
+            heartbeat_path(tmp_path),
+            {"pid": DEAD_PID, "timestamp": _utcnow_iso()},
+        )
+        assert _is_lock_stale(DEAD_PID, str(tmp_path)) is False
+
+    def test_dead_holder_with_stale_dead_heartbeat_is_stale(self, tmp_path):
+        write_heartbeat(
+            heartbeat_path(tmp_path),
+            {"pid": DEAD_PID, "timestamp": "2020-01-01T00:00:00Z"},
+        )
+        assert _is_lock_stale(DEAD_PID, str(tmp_path)) is True
+
+
+class TestEngineLockStaleRecovery:
+    """End-to-end: acquire() recovers from an abandoned lock file."""
+
+    def test_steals_lock_with_dead_holder_no_heartbeat(self, tmp_path):
+        zombie = _plant_blocking_lock(tmp_path, DEAD_PID)
+        try:
+            lock = EngineLock(str(tmp_path))
+            lock.acquire()
+            try:
+                # Fresh lock file now records our pid.
+                with open(lock.path) as f:
+                    assert int(f.read().strip()) == os.getpid()
+            finally:
+                lock.release()
+        finally:
+            _release_zombie(zombie)
+
+    def test_steals_lock_with_dead_holder_and_stale_heartbeat(self, tmp_path):
+        zombie = _plant_blocking_lock(tmp_path, DEAD_PID)
+        write_heartbeat(
+            heartbeat_path(tmp_path),
+            {"pid": DEAD_PID, "timestamp": "2020-01-01T00:00:00Z"},
+        )
+        try:
+            with EngineLock(str(tmp_path)):
+                pass  # acquire+release without raising is the assertion
+        finally:
+            _release_zombie(zombie)
+
+    def test_refuses_to_steal_when_holder_is_alive(self, tmp_path):
+        zombie = _plant_blocking_lock(tmp_path, os.getpid())
+        try:
+            lock = EngineLock(str(tmp_path))
+            with pytest.raises(EngineLockError) as exc:
+                lock.acquire()
+            assert exc.value.holder_pid == os.getpid()
+        finally:
+            _release_zombie(zombie)
+
+    def test_refuses_to_steal_on_empty_pid_file(self, tmp_path):
+        # File exists + flocked, but pid wasn't written yet (mid-acquire).
+        zombie = _plant_blocking_lock(tmp_path, None)
+        try:
+            lock = EngineLock(str(tmp_path))
+            with pytest.raises(EngineLockError) as exc:
+                lock.acquire()
+            assert exc.value.holder_pid is None
+        finally:
+            _release_zombie(zombie)
