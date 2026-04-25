@@ -39,12 +39,15 @@ shell without touching the agents.
 
 ```
 camflow run <workflow.yaml>              # start from beginning (reset state)
+camflow run --daemon <workflow.yaml>     # background engine + watchdog
+camflow run --daemon --no-watchdog ...   # background engine, no watchdog
 camflow resume <workflow.yaml>           # pick up from last checkpoint
 camflow resume <workflow.yaml> --from N  # jump pc to node N, then continue
-camflow stop                             # SIGTERM the engine (graceful)
-camflow stop --force                     # SIGKILL the engine
-camflow status                           # engine + workflow liveness
+camflow stop                             # SIGTERM the watchdog then engine
+camflow stop --force                     # SIGKILL (no cleanup)
+camflow status                           # engine + watchdog + workflow liveness
 camflow status <workflow.yaml>           # override auto-discovery
+camflow watchdog <workflow.yaml>         # run the watchdog loop manually
 camflow plan "<request>"                 # generate a workflow from NL
 camflow evolve report <dir>              # trace-based eval reports
 camflow scout --type ... --query ...     # planner scout (read-only)
@@ -129,6 +132,104 @@ Unlinking a file while another process still holds flock on its
 inode is safe: the stealer's `open` returns a brand-new inode and
 the old flock becomes irrelevant.
 
+## Watchdog process
+
+The engine's heartbeat tells you *when* it's gone, but it can't bring
+itself back. That's the watchdog's job.
+
+When you start a daemonized engine (`camflow run --daemon` or
+`camflow resume --daemon`), the parent forks a sibling — not a
+child — process that runs `camflow watchdog` against the same
+workflow. The watchdog and the engine share no state in memory; they
+talk only through `.camflow/`.
+
+```
+camflow run --daemon workflow.yaml
+    │
+    ├── fork #1 — engine daemon (writes heartbeat.json, holds engine.lock)
+    │
+    └── fork #2 — watchdog daemon (holds watchdog.lock, writes watchdog.log)
+```
+
+### Decision loop
+
+Every `--poll-interval` seconds (default 30) the watchdog reads
+`state.json` and `heartbeat.json` and applies the rule below:
+
+| state.status | heartbeat fresh? | engine pid alive? | watchdog action |
+|---|---|---|---|
+| `done` / `failed` / `interrupted` / `aborted` / `engine_error` | — | — | exit 0 (workflow is over) |
+| `running` (or anything else) | yes | yes | sleep, poll again |
+| `running` | yes | **no** | crash → `camflow resume --daemon` |
+| `running` | **no** | yes | hung → `camflow resume --daemon` |
+| `running` | **no** | no | crash → `camflow resume --daemon` |
+| no `state.json` yet | — | — | sleep, poll again (engine still booting) |
+
+The "stale heartbeat with a live pid" case is the most subtle: the
+engine process is *there* but hasn't written a heartbeat in over 60
+seconds (the watchdog uses a tighter threshold than the 120s
+operator-facing one — see `DEFAULT_WATCHDOG_STALE_THRESHOLD`). That
+indicates an internal hang — typically a `camc` command stuck on a
+network call — and is treated identically to a crash. The new engine
+spawned by `camflow resume` will hit the engine lock, find the dead
+predecessor's pid, self-heal the lock, and continue.
+
+### Restart budget
+
+Default 3 auto-restarts (`--max-restarts 3` / `--watchdog-max-restarts`
+on the spawn side). After the budget is exhausted the watchdog logs
+`restart budget exhausted` and exits with code 2; manual intervention
+is required. The counter is in-memory only — restarting the watchdog
+itself resets it, which matches the intuition that the operator is
+now involved and is expected to choose how aggressive to be.
+
+A `--restart-cooldown` (default 45s) is applied after each
+`camflow resume` spawn so the new engine has time to write its first
+heartbeat before the watchdog's next poll, avoiding a false "engine
+still dead" detection during the brief startup window.
+
+### Files
+
+| File                    | Written by | Read by | Lifetime |
+|-------------------------|------------|---------|----------|
+| `.camflow/watchdog.lock`| watchdog   | other watchdogs (acquire), `stop` (cleanup) | Removed on exit |
+| `.camflow/watchdog.pid` | watchdog   | `status`, `stop` | Removed on exit |
+| `.camflow/watchdog.log` | watchdog   | operators | Appended forever |
+
+The lock uses the same `fcntl.flock` pattern as `EngineLock` and
+auto-heals stale pids the same way: a re-spawn (e.g. when the
+watchdog itself crashed without releasing) overwrites cleanly.
+
+### Stop ordering
+
+`camflow stop` always signals the **watchdog first**, waits for it to
+exit, and only then signals the engine. Otherwise the watchdog would
+observe the engine's death mid-shutdown and resurrect it from under
+us. The engine's clean shutdown writes `status=interrupted` to
+`state.json`, so even if the watchdog were still alive it would see
+a terminal status and exit on its own — but stopping it first removes
+the race entirely.
+
+### Disabling
+
+`camflow run --daemon --no-watchdog workflow.yaml` (and the same flag
+on `camflow resume --daemon`) skips the watchdog spawn. Use it when
+you want a one-shot daemon without auto-recovery (debugging,
+experiments, embedding inside another supervisor like systemd).
+
+### Manual invocation
+
+```
+camflow watchdog workflow.yaml \
+    --poll-interval 30 \
+    --max-restarts 3 \
+    --stale-threshold 60 \
+    --restart-cooldown 45
+```
+
+Useful for attaching a watchdog to an engine that was started
+without `--daemon`, or for testing the watchdog in isolation.
+
 ## Crash recovery flow
 
 ```
@@ -170,6 +271,7 @@ For `camflow resume` the flow skips the wipe and instead reads
 $ camflow status
 Workflow: /path/to/workflow.yaml
 Engine:   ALIVE (pid 12345, heartbeat 5s ago)
+Watchdog: ALIVE (pid 12346)
 Node:     eval_swerv (iteration 3, attempt 1)
 Agent:    5130c656 (running, 2m 30s)
 Progress: 1/4 nodes completed
@@ -186,6 +288,7 @@ Dead:
 $ camflow status
 Workflow: /path/to/workflow.yaml
 Engine:   DEAD (last heartbeat 12m ago, pid 12345 not running)
+Watchdog: ALIVE (pid 12346)
 Node:     eval_swerv (iteration 3, attempt 1) — was in progress
 Progress: 1/4 nodes completed
   [done] eval_vexriscv
@@ -253,5 +356,8 @@ Workflow finished: status=done, pc=verify
 | `engine.lock`     | `EngineLock`      | competing engines             | Removed on exit |
 | `engine.pid`      | `--daemon` only   | `stop` (fallback)             | Persisted; stale after exit |
 | `engine.log`      | `--daemon` only   | operators                     | Appended forever |
+| `watchdog.lock`   | watchdog          | competing watchdogs, `stop`   | Removed on exit |
+| `watchdog.pid`    | watchdog          | `status`, `stop`              | Removed on exit |
+| `watchdog.log`    | watchdog          | operators                     | Appended forever |
 | `trace.log`       | engine main loop  | `evolve report`               | Appended forever |
 | `progress.json`   | engine main loop  | humans, external dashboards   | Overwritten each step |
