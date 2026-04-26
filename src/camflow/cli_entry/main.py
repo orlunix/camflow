@@ -28,6 +28,7 @@ import sys
 from camflow.backend.cam.engine import Engine, EngineConfig
 from camflow.cli_entry.chat import chat_command
 from camflow.cli_entry.ctl import ctl_command
+from camflow.cli_entry.plan_tool import plan_tool_command
 from camflow.cli_entry.steward import steward_command
 from camflow.cli_entry.daemon import daemonize_engine, spawn_watchdog
 from camflow.cli_entry.evolve import build_parser as build_evolve_parser
@@ -217,6 +218,10 @@ def _run_steward(argv):
     return steward_command(argv)
 
 
+def _run_plan_tool(argv):
+    return plan_tool_command(argv)
+
+
 def _print_top_help():
     print(__doc__.strip())
     print(
@@ -253,6 +258,8 @@ def main():
         rc = _run_chat(argv[1:])
     elif argv[0] == "steward":
         rc = _run_steward(argv[1:])
+    elif argv[0] == "plan-tool":
+        rc = _run_plan_tool(argv[1:])
     elif argv[0] == "run":
         # Explicit `run` is a synonym for the default positional-path
         # mode — same parser, same flags, argv[1] is the workflow.
