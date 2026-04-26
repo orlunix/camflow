@@ -180,3 +180,96 @@ class TestStatusCLI:
         assert "abc123 (running" in out
         assert "m " in out  # at least one minute of duration
         assert rc == 0
+
+
+class TestStewardRow:
+    """``camflow status`` shows a Steward line — NONE, ALIVE, or DEAD."""
+
+    def test_no_steward_shows_none(self, tmp_path, capsys):
+        wf = _wf(tmp_path)
+        _state(tmp_path)
+        write_heartbeat(
+            heartbeat_path(tmp_path),
+            {
+                "pid": os.getpid(),
+                "timestamp": _utcnow_iso(),
+                "pc": "build",
+                "uptime_seconds": 1,
+            },
+        )
+        rc = status_command(_args(wf))
+        out = capsys.readouterr().out
+        assert "Steward:  NONE" in out
+        assert rc == 0
+
+    def test_alive_steward_shows_alive(self, tmp_path, capsys, monkeypatch):
+        import json
+        from camflow.steward.spawn import STEWARD_POINTER_FILE
+
+        wf = _wf(tmp_path)
+        _state(tmp_path)
+        write_heartbeat(
+            heartbeat_path(tmp_path),
+            {
+                "pid": os.getpid(),
+                "timestamp": _utcnow_iso(),
+                "pc": "build",
+                "uptime_seconds": 1,
+            },
+        )
+        # Seed a Steward pointer.
+        (tmp_path / ".camflow" / STEWARD_POINTER_FILE).write_text(
+            json.dumps(
+                {
+                    "agent_id": "steward-7c2a",
+                    "name": "steward-7c2a",
+                    "spawned_at": "2026-04-26T10:00:00Z",
+                }
+            )
+        )
+        # Force ALIVE.
+        from camflow.cli_entry import steward as steward_cli_module
+        monkeypatch.setattr(
+            steward_cli_module, "is_steward_alive", lambda *a, **k: True,
+        )
+        rc = status_command(_args(wf))
+        out = capsys.readouterr().out
+        assert "Steward:  ALIVE" in out
+        assert "steward-7c2a" in out
+        assert rc == 0
+
+    def test_dead_steward_shows_dead_with_restart_hint(
+        self, tmp_path, capsys, monkeypatch,
+    ):
+        import json
+        from camflow.steward.spawn import STEWARD_POINTER_FILE
+
+        wf = _wf(tmp_path)
+        _state(tmp_path)
+        write_heartbeat(
+            heartbeat_path(tmp_path),
+            {
+                "pid": os.getpid(),
+                "timestamp": _utcnow_iso(),
+                "pc": "build",
+                "uptime_seconds": 1,
+            },
+        )
+        (tmp_path / ".camflow" / STEWARD_POINTER_FILE).write_text(
+            json.dumps(
+                {
+                    "agent_id": "steward-dead",
+                    "name": "steward-dead",
+                    "spawned_at": "2026-04-26T10:00:00Z",
+                }
+            )
+        )
+        from camflow.cli_entry import steward as steward_cli_module
+        monkeypatch.setattr(
+            steward_cli_module, "is_steward_alive", lambda *a, **k: False,
+        )
+        rc = status_command(_args(wf))
+        out = capsys.readouterr().out
+        assert "Steward:  DEAD" in out
+        assert "camflow steward restart" in out
+        assert rc == 0

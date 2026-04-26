@@ -230,6 +230,28 @@ def status_command(args) -> int:
     else:
         print(f"Watchdog: DEAD (pid {wd_pid} not running — stale pidfile)")
 
+    # Steward line — project-scoped agent (lives across flows). NONE
+    # is normal for projects that have only ever run with --no-steward.
+    try:
+        from camflow.cli_entry.steward import (
+            steward_status_for_status_command,
+        )
+        sw = steward_status_for_status_command(project_dir)
+        if not sw.get("present"):
+            print("Steward:  NONE (run with default settings to spawn one)")
+        elif sw.get("alive"):
+            print(
+                f"Steward:  ALIVE ({sw['agent_id']}, born {sw['age']})"
+            )
+        else:
+            print(
+                f"Steward:  DEAD ({sw['agent_id']}, born {sw['age']}; "
+                "use `camflow steward restart` to respawn)"
+            )
+    except Exception:
+        # Status must never fail because of optional Steward plumbing.
+        pass
+
     # Node line — carries iteration + attempt so the user can see if
     # the engine is stuck re-running the same node.
     iteration = (heartbeat or {}).get("iteration")
