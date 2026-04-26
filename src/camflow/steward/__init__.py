@@ -17,6 +17,16 @@ handoff, and the ``camflow chat``/``ctl`` interfaces live alongside
 this package or under ``cli_entry/``.
 """
 
+from camflow.steward.events import (
+    EVENT_PREFIX,
+    EVENT_TYPES,
+    emit,
+    emit_flow_started,
+    emit_flow_terminal,
+    emit_node_done,
+    emit_node_failed,
+    emit_node_started,
+)
 from camflow.steward.spawn import (
     STEWARD_POINTER_FILE,
     is_steward_alive,
@@ -25,7 +35,15 @@ from camflow.steward.spawn import (
 )
 
 __all__ = [
+    "EVENT_PREFIX",
+    "EVENT_TYPES",
     "STEWARD_POINTER_FILE",
+    "emit",
+    "emit_flow_started",
+    "emit_flow_terminal",
+    "emit_node_done",
+    "emit_node_failed",
+    "emit_node_started",
     "is_steward_alive",
     "load_steward_pointer",
     "spawn_steward",
