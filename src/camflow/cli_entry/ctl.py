@@ -414,6 +414,7 @@ def _load_verb_registrations() -> None:
     modules_to_load: list[str] = [
         "camflow.cli_entry.ctl_read",
         "camflow.cli_entry.ctl_mutate",
+        "camflow.cli_entry.ctl_steward",
     ]
     for mod in modules_to_load:
         try:

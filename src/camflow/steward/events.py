@@ -476,3 +476,41 @@ def emit_heartbeat_stale_worker(
         since_s=int(since_s),
         **kwargs,
     )
+
+
+def emit_checkpoint_now(
+    project_dir: str | os.PathLike,
+    *,
+    flow_id: str | None = None,
+    reason: str = "periodic",
+    **kwargs: Any,
+) -> bool:
+    """Tell the Steward to checkpoint its working memory now (write
+    summary.md). Engine emits every 20 events or every 30 minutes
+    per design §7.8."""
+    return emit(
+        project_dir,
+        "checkpoint_now",
+        flow_id=flow_id,
+        reason=reason,
+        **kwargs,
+    )
+
+
+def emit_flow_idle(
+    project_dir: str | os.PathLike,
+    *,
+    flow_id: str,
+    pc: str | None = None,
+    **kwargs: Any,
+) -> bool:
+    """Tell the Steward the flow is over and it should fold its
+    working summary into the per-flow archive. Steward calls
+    ``ctl archive-summary`` in response."""
+    return emit(
+        project_dir,
+        "flow_idle",
+        flow_id=flow_id,
+        pc=pc,
+        **kwargs,
+    )

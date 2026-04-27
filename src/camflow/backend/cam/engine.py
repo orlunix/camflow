@@ -66,8 +66,10 @@ from camflow.registry import (
     on_agent_spawned,
 )
 from camflow.steward import (
+    emit_checkpoint_now,
     emit_engine_resumed,
     emit_escalation_level_change,
+    emit_flow_idle,
     emit_flow_started,
     emit_flow_terminal,
     emit_heartbeat_stale_worker,
@@ -405,6 +407,53 @@ class Engine:
                 "steward emit_heartbeat_stale_worker failed", e,
             )
 
+    def _emit_steward_checkpoint_now(self, reason):
+        if self._steward_short_circuit():
+            return
+        try:
+            emit_checkpoint_now(
+                self.project_dir,
+                flow_id=self.state.get("flow_id"),
+                reason=reason,
+            )
+        except Exception as e:
+            self._log_engine_error(
+                "steward emit_checkpoint_now failed", e,
+            )
+
+    def _emit_steward_flow_idle(self):
+        if self._steward_short_circuit():
+            return
+        try:
+            emit_flow_idle(
+                self.project_dir,
+                flow_id=self.state.get("flow_id"),
+                pc=self.state.get("pc"),
+            )
+        except Exception as e:
+            self._log_engine_error("steward emit_flow_idle failed", e)
+
+    def _maybe_emit_checkpoint(self):
+        """Emit ``checkpoint_now`` to the Steward every 20 events or
+        every 30 minutes, whichever comes first (design §7.8)."""
+        if self._steward_short_circuit():
+            return
+        # Track via instance attrs initialised lazily.
+        if not hasattr(self, "_checkpoint_event_count"):
+            self._checkpoint_event_count = 0
+            self._checkpoint_last_emit = time.time()
+        self._checkpoint_event_count += 1
+        elapsed = time.time() - self._checkpoint_last_emit
+        if self._checkpoint_event_count >= 20 or elapsed >= 1800:
+            reason = (
+                "20-event-threshold"
+                if self._checkpoint_event_count >= 20
+                else "30-min-elapsed"
+            )
+            self._emit_steward_checkpoint_now(reason)
+            self._checkpoint_event_count = 0
+            self._checkpoint_last_emit = time.time()
+
     def _load_workflow(self):
         self.workflow = load_workflow(self.workflow_path)
         valid, errors = validate_workflow(self.workflow)
@@ -680,6 +729,10 @@ class Engine:
             # itself stays alive (project-scoped); it just transitions
             # to "no active flow" mode after writing its final summary.
             self._emit_steward_flow_terminal()
+            # Phase B: signal that the flow is now idle so the
+            # Steward calls ``ctl archive-summary`` and folds its
+            # working memory for this flow into the long-term archive.
+            self._emit_steward_flow_idle()
 
             # ALWAYS clean up agents on exit — success, failure, signal,
             # uncaught exception, anything. Two passes: (1) explicitly
@@ -887,6 +940,9 @@ class Engine:
         # not the engine's routing decision (which lands in trace.log
         # as a `step` entry).
         self._emit_steward_node_finished(node_id, result, agent_id)
+
+        # Phase B: rate-limited checkpoint_now (every 20 events / 30m).
+        self._maybe_emit_checkpoint()
 
         return self._apply_result_and_transition(
             node_id, node, result,
