@@ -97,6 +97,21 @@ class PlannerResult:
     duration_s: float
 
 
+@dataclass(frozen=True)
+class SpawnedPlanner:
+    """Returned by ``spawn_planner_only`` for callers that want to
+    drive their own polling / interactive loop instead of the
+    blocking poll baked into ``generate_workflow_via_agent``.
+    """
+    agent_id: str
+    name: str
+    flow_id: str
+    project_dir: str
+    workflow_path: str
+    rationale_path: str
+    started_at: float
+
+
 # ---- helpers -----------------------------------------------------------
 
 

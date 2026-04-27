@@ -29,6 +29,7 @@ from camflow.backend.cam.engine import Engine, EngineConfig
 from camflow.cli_entry.chat import chat_command
 from camflow.cli_entry.ctl import ctl_command
 from camflow.cli_entry.plan_tool import plan_tool_command
+from camflow.cli_entry.smooth import smooth_command
 from camflow.cli_entry.steward import steward_command
 from camflow.cli_entry.daemon import daemonize_engine, spawn_watchdog
 from camflow.cli_entry.evolve import build_parser as build_evolve_parser
@@ -222,6 +223,28 @@ def _run_plan_tool(argv):
     return plan_tool_command(argv)
 
 
+def _run_smooth(argv):
+    return smooth_command(argv)
+
+
+def _looks_like_workflow_path(token: str) -> bool:
+    """Heuristic for the default-positional dispatch: is ``token`` a
+    workflow path (run a yaml) or a natural-language request (smooth
+    mode)?
+
+    Yaml paths are recognised by either:
+      - actually existing on disk as a file, or
+      - ending in ``.yaml`` / ``.yml`` (even if the file doesn't yet
+        exist — caller will get a clear "not found" error from the
+        run path rather than a confusing planner-spawn).
+    """
+    if not token:
+        return False
+    if os.path.isfile(token):
+        return True
+    return token.endswith(".yaml") or token.endswith(".yml")
+
+
 def _print_top_help():
     print(__doc__.strip())
     print(
@@ -264,8 +287,14 @@ def main():
         # Explicit `run` is a synonym for the default positional-path
         # mode — same parser, same flags, argv[1] is the workflow.
         rc = _run_workflow(argv[1:])
-    else:
+    elif _looks_like_workflow_path(argv[0]):
+        # Default-positional run: ``camflow path/to/workflow.yaml``.
         rc = _run_workflow(argv)
+    else:
+        # Phase C: natural-language smooth mode. The first positional
+        # is the request; the rest are flags. ``camflow "build me a
+        # thing"``.
+        rc = _run_smooth(argv)
     sys.exit(rc)
 
 
