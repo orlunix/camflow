@@ -139,7 +139,11 @@ def test_every_literal_emitted_kind_is_known():
 
 
 _EMIT_TYPE_RE = re.compile(
-    r"""(?:^|[^.\w])emit\(\s*[^,]+,\s*\n?\s*['"](?P<typ>[a-z_]+)['"]""",
+    # ``emit(<arg1>, "<type>"`` where <arg1> is a single argument
+    # expression (no commas, no closing paren — so we don't match
+    # ``emit()`` followed by an unrelated quoted string later in the
+    # same source).
+    r"""(?:^|[^.\w])emit\(\s*[^,)]+,\s*\n?\s*['"](?P<typ>[a-z_]+)['"]""",
     re.MULTILINE,
 )
 

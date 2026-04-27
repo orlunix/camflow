@@ -62,6 +62,16 @@ class TestEnsureSteward:
         m_spawn.assert_not_called()
 
     def test_alive_steward_does_not_respawn(self, tmp_path):
+        # A pointer file must exist for is_steward_alive=True to be a
+        # consistent state (Phase B: _ensure_steward checks the pointer
+        # before deciding spawn vs reattach vs handoff).
+        import json
+        cf = tmp_path / ".camflow"
+        cf.mkdir(parents=True, exist_ok=True)
+        (cf / "steward.json").write_text(json.dumps({
+            "agent_id": "steward-alive",
+            "name": "steward-alive",
+        }))
         eng = _make_engine(tmp_path)
         with patch(
             "camflow.backend.cam.engine.is_steward_alive",

@@ -206,27 +206,53 @@ class Engine:
                 f.write("\n")
 
     def _ensure_steward(self):
-        """Spawn or reattach the project-scoped Steward.
+        """Spawn / reattach / handoff the project-scoped Steward.
 
-        Called once during ``run()`` after the engine.lock is held but
-        before the main loop starts. Steward is project-scoped, so a
-        live one from a previous flow is reused; only a missing /
-        dead one triggers a spawn. ``--no-steward`` short-circuits the
-        whole thing.
+        Three branches:
+          - LIVE              → reattach (no-op; subsequent emit()
+                                calls will route to it).
+          - POINTER + DEAD    → Phase B: handoff. Archive the dead
+                                Steward's directory, fold its summary
+                                into archive.md, spawn a fresh one
+                                with the predecessor's memory carried
+                                over.
+          - NO POINTER        → fresh spawn.
 
-        Failures are logged and swallowed: a Steward problem must
-        never prevent the engine from running.
+        ``--no-steward`` short-circuits the whole thing. Failures are
+        logged and swallowed: a Steward problem must never prevent
+        the engine from running.
         """
         if self.config.no_steward:
             return None
         try:
-            if is_steward_alive(self.project_dir):
-                return None  # reattach via subsequent emit() calls
-            spawn_steward(
-                self.project_dir,
-                workflow_path=self.workflow_path,
-                spawned_by=f"engine ({self.state.get('flow_id', 'unknown')})",
+            from camflow.steward.spawn import load_steward_pointer
+
+            pointer = load_steward_pointer(self.project_dir)
+            if pointer and is_steward_alive(self.project_dir):
+                return None  # reattach — emit() will route here
+
+            spawned_by = (
+                f"engine ({self.state.get('flow_id', 'unknown')})"
             )
+
+            if pointer and pointer.get("agent_id"):
+                # Pointer exists but agent is dead — Phase B handoff.
+                # This preserves working memory across the engine
+                # restart / Steward death.
+                from camflow.steward.handoff import handoff_steward
+                handoff_steward(
+                    self.project_dir,
+                    reason="dead steward at engine startup",
+                    workflow_path=self.workflow_path,
+                    spawned_by=spawned_by + " (handoff)",
+                )
+            else:
+                # No pointer at all — fresh project, fresh Steward.
+                spawn_steward(
+                    self.project_dir,
+                    workflow_path=self.workflow_path,
+                    spawned_by=spawned_by,
+                )
         except Exception as e:
             self._log_engine_error("steward spawn/reattach failed", e)
             # Engine continues; events will be mirrored to disk and
