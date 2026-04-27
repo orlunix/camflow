@@ -21,6 +21,38 @@ Event-entry schema (any non-step kind):
 
 Readers MUST default missing ``kind`` to ``"step"`` for backward compat
 with traces written before this field existed.
+
+Relationship to ``camflow.steward.events.EVENT_TYPES``
+─────────────────────────────────────────────────────
+Two CLOSED sets exist in this codebase, with deliberately different
+audiences:
+
+  ``tracer.EVENT_KINDS``         — values of the ``kind`` field in
+                                   ``trace.log``. Audit / timeline channel.
+
+  ``steward.events.EVENT_TYPES`` — values the engine pushes to the
+                                   Steward via ``camc send`` as
+                                   ``[CAMFLOW EVENT] {"type": "...", ...}``.
+                                   Push channel.
+
+When the engine pushes a Steward event, the trace records the push
+attempt as ``kind="event_emitted"`` with the Steward type carried in
+the ``event_type`` field — NOT as its own kind. So a Steward
+``node_done`` event lands in trace as
+``{"kind": "event_emitted", "event_type": "node_done", ...}``, not as
+``{"kind": "node_done", ...}``.
+
+A few names appear in both sets on purpose: ``flow_started`` /
+``flow_terminal`` / ``flow_idle`` are project-level state transitions
+that warrant a direct audit entry in addition to the Steward push.
+The current implementation only wires the Steward push for these;
+direct project-level emission lands in Phase B as the audit trail
+tightens (see ``docs/triage-2026-04-26.md`` §5.2).
+``compaction_detected`` and ``handoff_completed`` live in this set
+(tracer only) — they are written when the engine archives an old
+Steward, never pushed to a Steward.
+
+Drift between the two sets is caught by ``tests/unit/test_event_sets.py``.
 """
 
 import copy
@@ -30,8 +62,11 @@ from datetime import datetime, timezone
 # Step entries get this; event entries set kind to one of EVENT_KINDS.
 STEP_KIND = "step"
 
-# Closed set of event kinds. Adding one is a design-doc change; do not
-# extend casually. See docs/design-next-phase.md §13.1.
+# Closed set of trace.log entry kinds. Adding one is a design-doc
+# change; do not extend casually. See docs/design-next-phase.md §13.1.
+#
+# Intentional overlap with steward.events.EVENT_TYPES — see this
+# module's docstring for the relationship contract.
 EVENT_KINDS = frozenset({
     # agent lifecycle
     "agent_spawned", "agent_completed", "agent_failed", "agent_killed",
@@ -43,7 +78,8 @@ EVENT_KINDS = frozenset({
     "engine_started", "engine_stopped",
     "lock_acquired", "lock_released", "lock_stolen",
     "watchdog_action",
-    # steward-specific
+    # project-level steward / flow state transitions (also appear in
+    # steward.events.EVENT_TYPES — see docstring)
     "compaction_detected", "handoff_completed",
     "flow_started", "flow_terminal", "flow_idle",
 })

@@ -21,6 +21,16 @@ Closed event-type set (matches docs/design-next-phase.md §7.3):
     node_retry, escalation_level_change, verify_failed,
     heartbeat_stale_worker, replan_done, engine_resumed,
     checkpoint_now
+
+Relationship to ``camflow.backend.cam.tracer.EVENT_KINDS``
+─────────────────────────────────────────────────────────
+``EVENT_TYPES`` is the engine→Steward PUSH channel (what the Steward
+sees). ``tracer.EVENT_KINDS`` is the trace.log AUDIT channel (what
+gets recorded for forensics). Every Steward event additionally
+appears in trace.log as ``kind="event_emitted"`` with the type
+carried in the ``event_type`` field — NOT as its own kind. See
+``tracer.py`` docstring for the full contract; ``test_event_sets.py``
+catches drift.
 """
 
 from __future__ import annotations
