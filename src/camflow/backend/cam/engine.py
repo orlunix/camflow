@@ -67,11 +67,15 @@ from camflow.registry import (
 )
 from camflow.steward import (
     emit_engine_resumed,
+    emit_escalation_level_change,
     emit_flow_started,
     emit_flow_terminal,
+    emit_heartbeat_stale_worker,
     emit_node_done,
     emit_node_failed,
+    emit_node_retry,
     emit_node_started,
+    emit_verify_failed,
     is_steward_alive,
     spawn_steward,
 )
@@ -327,6 +331,79 @@ class Engine:
             )
         except Exception as e:
             self._log_engine_error("steward emit_engine_resumed failed", e)
+
+    # ---- Phase B extended events ------------------------------------
+
+    def _steward_short_circuit(self) -> bool:
+        """True iff Steward emission should be skipped (--no-steward,
+        or test bypassed __init__ so self.config doesn't exist)."""
+        cfg = getattr(self, "config", None)
+        if cfg is None:
+            return True
+        return bool(getattr(cfg, "no_steward", False))
+
+    def _emit_steward_node_retry(self, node_id, attempt, error_code):
+        if self._steward_short_circuit():
+            return
+        try:
+            emit_node_retry(
+                self.project_dir,
+                flow_id=self.state.get("flow_id"),
+                node=node_id,
+                attempt=attempt,
+                error_code=error_code,
+            )
+        except Exception as e:
+            self._log_engine_error("steward emit_node_retry failed", e)
+
+    def _emit_steward_escalation_change(self, node_id, from_level, to_level):
+        if self._steward_short_circuit():
+            return
+        try:
+            emit_escalation_level_change(
+                self.project_dir,
+                flow_id=self.state.get("flow_id"),
+                node=node_id,
+                from_level=from_level,
+                to_level=to_level,
+            )
+        except Exception as e:
+            self._log_engine_error(
+                "steward emit_escalation_level_change failed", e,
+            )
+
+    def _emit_steward_verify_failed(
+        self, node_id, verify_cmd, exit_code, stderr_tail,
+    ):
+        if self._steward_short_circuit():
+            return
+        try:
+            emit_verify_failed(
+                self.project_dir,
+                flow_id=self.state.get("flow_id"),
+                node=node_id or "?",
+                verify_cmd=verify_cmd,
+                exit_code=exit_code,
+                stderr_tail=stderr_tail,
+            )
+        except Exception as e:
+            self._log_engine_error("steward emit_verify_failed failed", e)
+
+    def _emit_steward_heartbeat_stale(self, node_id, agent_id, since_s):
+        if self._steward_short_circuit():
+            return
+        try:
+            emit_heartbeat_stale_worker(
+                self.project_dir,
+                flow_id=self.state.get("flow_id"),
+                node=node_id,
+                agent_id=agent_id,
+                since_s=since_s,
+            )
+        except Exception as e:
+            self._log_engine_error(
+                "steward emit_heartbeat_stale_worker failed", e,
+            )
 
     def _load_workflow(self):
         self.workflow = load_workflow(self.workflow_path)
@@ -1100,10 +1177,22 @@ class Engine:
                     "stdout": (proc.stdout or "")[-500:],
                     "stderr": (proc.stderr or "")[-200:],
                 }
+                self._emit_steward_verify_failed(
+                    node_id=self.state.get("pc"),
+                    verify_cmd=resolved,
+                    exit_code=proc.returncode,
+                    stderr_tail=proc.stderr or "",
+                )
         except subprocess.TimeoutExpired:
             result["status"] = "fail"
             result["summary"] = f"verify timed out: {resolved}"
             result["error"] = {"code": "VERIFY_TIMEOUT"}
+            self._emit_steward_verify_failed(
+                node_id=self.state.get("pc"),
+                verify_cmd=resolved,
+                exit_code=124,  # conventional timeout exit
+                stderr_tail="(timeout)",
+            )
         except Exception as exc:
             result["status"] = "fail"
             result["summary"] = f"verify error: {exc}"
@@ -1217,6 +1306,22 @@ class Engine:
             max_retries = node_max_retries if isinstance(node_max_retries, int) else self.config.max_retries
             retry_count = self.state["retry_counts"].get(node_id, 0)
             if retry_count + 1 < max_retries:
+                # Phase B: notify the Steward this node is being
+                # retried (rate-limited by the emitter).
+                self._emit_steward_node_retry(
+                    node_id,
+                    retry_count + 1,
+                    (error or {}).get("code") if isinstance(error, dict) else None,
+                )
+
+                # Phase B: detect escalation level change and notify.
+                prev_escalation = get_escalation_level(input_state, node_id)
+                new_escalation = get_escalation_level(self.state, node_id)
+                if new_escalation != prev_escalation:
+                    self._emit_steward_escalation_change(
+                        node_id, prev_escalation, new_escalation,
+                    )
+
                 # Budget not exhausted — retry same node next iter.
                 # enrich_state has already recorded the attempt in
                 # state.failed_approaches and state.blocked.

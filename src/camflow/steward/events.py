@@ -354,3 +354,125 @@ def emit_engine_resumed(
         resumed_from=resumed_from,
         **kwargs,
     )
+
+
+# ---- Phase B extended event set (design §7.3) -------------------------
+
+
+# Engine-side rate limiter for node_retry (OQ-3 = C). Per (flow_id,
+# node_id) we coalesce events within RETRY_COALESCE_WINDOW seconds and
+# emit a count.
+RETRY_COALESCE_WINDOW = 30.0
+_RETRY_LAST_EMIT: dict[tuple[str, str], tuple[float, int]] = {}
+
+
+def emit_node_retry(
+    project_dir: str | os.PathLike,
+    *,
+    flow_id: str,
+    node: str,
+    attempt: int,
+    error_code: str | None = None,
+    **kwargs: Any,
+) -> bool:
+    """Tell the Steward a node is being retried.
+
+    Coalesced engine-side: bursts within ``RETRY_COALESCE_WINDOW``
+    seconds for the same (flow, node) emit once with a ``since_count``
+    field summarising the burst. Use ``reset_retry_coalesce_for_tests``
+    to clear the buffer between tests.
+    """
+    import time as _time
+    key = (flow_id or "", node or "")
+    now = _time.monotonic()
+    last = _RETRY_LAST_EMIT.get(key)
+    if last is not None and (now - last[0]) < RETRY_COALESCE_WINDOW:
+        # Still inside the coalesce window — bump the count and skip.
+        _RETRY_LAST_EMIT[key] = (last[0], last[1] + 1)
+        return False
+
+    coalesced_count = 1
+    if last is not None:
+        coalesced_count = last[1] + 1  # carry the count from prior bucket
+    _RETRY_LAST_EMIT[key] = (now, 1)
+
+    return emit(
+        project_dir,
+        "node_retry",
+        flow_id=flow_id,
+        node=node,
+        attempt=attempt,
+        error_code=error_code,
+        since_count=coalesced_count,
+        **kwargs,
+    )
+
+
+def reset_retry_coalesce_for_tests() -> None:
+    _RETRY_LAST_EMIT.clear()
+
+
+def emit_escalation_level_change(
+    project_dir: str | os.PathLike,
+    *,
+    flow_id: str,
+    node: str,
+    from_level: int,
+    to_level: int,
+    **kwargs: Any,
+) -> bool:
+    """Engine raised the escalation level for a flailing node."""
+    return emit(
+        project_dir,
+        "escalation_level_change",
+        flow_id=flow_id,
+        node=node,
+        from_level=from_level,
+        to_level=to_level,
+        **kwargs,
+    )
+
+
+def emit_verify_failed(
+    project_dir: str | os.PathLike,
+    *,
+    flow_id: str,
+    node: str,
+    verify_cmd: str,
+    exit_code: int,
+    stderr_tail: str = "",
+    **kwargs: Any,
+) -> bool:
+    """A plan-level verify command claimed failure even though the
+    worker reported success. Engine downgrades the result to fail."""
+    return emit(
+        project_dir,
+        "verify_failed",
+        flow_id=flow_id,
+        node=node,
+        verify_cmd=verify_cmd,
+        exit_code=exit_code,
+        stderr_tail=(stderr_tail or "")[-500:],
+        **kwargs,
+    )
+
+
+def emit_heartbeat_stale_worker(
+    project_dir: str | os.PathLike,
+    *,
+    flow_id: str,
+    node: str,
+    agent_id: str,
+    since_s: float,
+    **kwargs: Any,
+) -> bool:
+    """A worker's heartbeat / liveness signal has gone stale."""
+    return emit(
+        project_dir,
+        "heartbeat_stale_worker",
+        flow_id=flow_id,
+        node=node,
+        agent_id=agent_id,
+        since_s=int(since_s),
+        **kwargs,
+    )
