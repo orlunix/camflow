@@ -231,8 +231,14 @@ def _resolve_project_dir(explicit: str | None) -> str:
 def dispatch(verb_name: str, argv: list[str], project_dir: str | None = None) -> int:
     """Run one ``ctl`` invocation. Returns an exit code.
 
-    Autonomous verbs run their handler. Confirm verbs queue to the
-    pending file and return 0 (the engine + user reconcile later).
+    Effective autonomy is resolved from the project's
+    ``steward-config.yaml`` (Phase B autonomy config), with the
+    verb's spec autonomy as the fallback when no config / no
+    override exists. Three levels:
+
+      autonomous → run inline via the verb's handler.
+      confirm    → queue to control-pending.jsonl.
+      block      → refuse — the user said ``never`` for this verb.
     """
     pdir = _resolve_project_dir(project_dir)
 
@@ -254,14 +260,45 @@ def dispatch(verb_name: str, argv: list[str], project_dir: str | None = None) ->
         # argparse already wrote the usage error to stderr.
         return int(e.code) if isinstance(e.code, int) else 2
 
-    if spec.autonomy == AUTONOMY_AUTONOMOUS:
-        try:
-            return int(spec.handler(args, pdir))
-        except Exception as exc:  # noqa: BLE001 — surface CLI error
+    # Resolve effective autonomy. The project's steward-config.yaml
+    # (Phase B) takes precedence over the verb's spec default; if no
+    # config / no preset entry / no override exists, fall back to the
+    # spec's own autonomy field.
+    try:
+        from camflow.steward.autonomy import (
+            effective_autonomy,
+            load_config,
+        )
+        effective = effective_autonomy(
+            verb_name, load_config(pdir), default=spec.autonomy,
+        )
+    except Exception:
+        effective = spec.autonomy  # fallback to spec default
+
+    if effective == "block" or effective == "never":
+        sys.stderr.write(
+            f"camflow ctl {verb_name}: blocked by project config "
+            "(set via 'never' on a previous confirm prompt; edit "
+            ".camflow/steward-config.yaml to unblock).\n"
+        )
+        return 1
+
+    if effective == AUTONOMY_AUTONOMOUS:
+        if spec.handler is None:
             sys.stderr.write(
-                f"camflow ctl {verb_name}: error: {exc}\n"
+                f"camflow ctl {verb_name}: project config promotes this "
+                "verb to autonomous, but the verb has no inline handler "
+                "(only confirm-flow queuing). Falling back to confirm.\n"
             )
-            return 1
+            effective = AUTONOMY_CONFIRM
+        else:
+            try:
+                return int(spec.handler(args, pdir))
+            except Exception as exc:  # noqa: BLE001
+                sys.stderr.write(
+                    f"camflow ctl {verb_name}: error: {exc}\n"
+                )
+                return 1
 
     # autonomy == "confirm" → queue and exit 0
     queue_pending(
