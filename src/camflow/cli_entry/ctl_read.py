@@ -210,34 +210,34 @@ def _register_all() -> None:
         handler=_handle_read_state,
         add_args=_add_read_state_args,
         help="print .camflow/state.json",
-    ))
+    ), replace=True)
     register_verb(VerbSpec(
         name="read-trace",
         autonomy=AUTONOMY_AUTONOMOUS,
         handler=_handle_read_trace,
         add_args=_add_read_trace_args,
         help="print last N trace.log entries (filter by --kind)",
-    ))
+    ), replace=True)
     register_verb(VerbSpec(
         name="read-events",
         autonomy=AUTONOMY_AUTONOMOUS,
         handler=_handle_read_events,
         add_args=_add_read_events_args,
         help="print last N steward-events.jsonl entries",
-    ))
+    ), replace=True)
     register_verb(VerbSpec(
         name="read-rationale",
         autonomy=AUTONOMY_AUTONOMOUS,
         handler=_handle_read_rationale,
         help="print .camflow/plan-rationale.md",
-    ))
+    ), replace=True)
     register_verb(VerbSpec(
         name="read-registry",
         autonomy=AUTONOMY_AUTONOMOUS,
         handler=_handle_read_registry,
         add_args=_add_read_registry_args,
         help="print .camflow/agents.json (table or --json)",
-    ))
+    ), replace=True)
 
 
 # Register on import so ``ctl._load_verb_registrations`` sees them.

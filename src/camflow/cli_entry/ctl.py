@@ -84,9 +84,13 @@ class VerbSpec:
 VERBS: dict[str, VerbSpec] = {}
 
 
-def register_verb(spec: VerbSpec) -> None:
-    """Register a verb. Raises if the name is already taken."""
-    if spec.name in VERBS:
+def register_verb(spec: VerbSpec, *, replace: bool = False) -> None:
+    """Register a verb. Raises if the name is already taken.
+
+    Tests that clear+repopulate the registry can pass ``replace=True``
+    to overwrite without raising.
+    """
+    if spec.name in VERBS and not replace:
         raise ValueError(f"verb {spec.name!r} already registered")
     VERBS[spec.name] = spec
 
@@ -359,6 +363,7 @@ def _load_verb_registrations() -> None:
     """
     modules_to_load: list[str] = [
         "camflow.cli_entry.ctl_read",
+        "camflow.cli_entry.ctl_mutate",
     ]
     for mod in modules_to_load:
         try:

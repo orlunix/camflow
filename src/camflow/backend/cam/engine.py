@@ -555,11 +555,34 @@ class Engine:
 
             # Main loop
             try:
-                while self.state.get("status") == "running":
+                while self.state.get("status") in ("running", "waiting"):
                     if self._interrupted:
                         self.state["status"] = "interrupted"
                         self._save_state()
                         break
+
+                    # Phase B: drain the control queue at the top of
+                    # every tick. The queue may flip status, kill the
+                    # current worker, override pc, or set skip_current.
+                    try:
+                        from camflow.backend.cam.control_drain import (
+                            drain_control_queue,
+                        )
+                        n_drained = drain_control_queue(
+                            self.project_dir, self.state,
+                        )
+                        if n_drained:
+                            self._save_state()
+                    except Exception as e:
+                        self._log_engine_error(
+                            "control queue drain failed", e,
+                        )
+
+                    # Pause path: keep the loop alive but do no work.
+                    if self.state.get("status") == "waiting":
+                        sleep_for = max(self.config.poll_interval, 1)
+                        time.sleep(sleep_for)
+                        continue
 
                     if self._workflow_timed_out():
                         self.state["status"] = "failed"
@@ -693,6 +716,32 @@ class Engine:
             self.state["error"] = {"code": "NODE_NOT_FOUND", "pc": node_id}
             self._save_state()
             return False
+
+        # Phase B: ctl skip — a queued ``skip`` command synthesizes a
+        # success result for the current node and lets the normal
+        # transition resolver advance. The skip_current flag is
+        # consumed once.
+        skip = self.state.get("skip_current")
+        if skip and skip.get("node") == node_id:
+            self.state.pop("skip_current", None)
+            self.step += 1
+            attempt = self.state["retry_counts"].get(node_id, 0) + 1
+            ts = time.time()
+            skip_reason = skip.get("reason") or "ctl skip"
+            result = {
+                "status": "success",
+                "summary": f"skipped via ctl: {skip_reason}",
+                "state_updates": {},
+            }
+            return self._apply_result_and_transition(
+                node_id, node, result,
+                ts_start=ts, ts_end=ts,
+                agent_id=None,
+                exec_mode=_infer_exec_mode(node),
+                completion_signal="ctl_skip",
+                event="ctl_skip",
+                attempt=attempt,
+            )
 
         # Loop detection. First offence → one rescue brainstorm. Second
         # offence on the same node → give up. ``brainstorm_done_for`` is
